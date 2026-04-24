@@ -6,9 +6,11 @@ import { GazeCalibrator } from "./calibration/GazeCalibrator.js";
 import { CalibrationUI } from "./calibration/CalibrationUI.js";
 import { OneEuroFilter } from "./utils/OneEuroFilter.js";
 
-// 1. Dichiarazione delle variabili a livello di modulo (senza inizializzazione sincrona)
 let video, canvas, ctx, gazeDot;
 let btnCalGaze, btnCalEmotion, calOverlay;
+
+let sessionData = [];
+let currentSmoothPos = { x: 0, y: 0 };
 
 let faceLandmarker;
 let lastVideoTime = -1;
@@ -16,18 +18,24 @@ let lastFrameTimeMs = performance.now();
 let isGazeCalibrating = false;
 let currentNormalizedIris = null;
 
-// Istanziamento dei motori logici
 const emotionAnalyzer = new FrustrationAnalyzer();
 const gazeCalibrator = new GazeCalibrator();
-const uiFilter = new OneEuroFilter(60, 0.5, 0.01, 1.0);
+const uiFilter = new OneEuroFilter(60, 0.1, 0.001, 1.0);
+const gazeEstimator = new GazeEstimator();
+
 let calibrationUI;
 
-// 2. Inizializzazione asincrona dei tensori
+// Canvas off-screen per il calcolo ultra-veloce della luminosità ambientale
+const lumaCanvas = document.createElement('canvas');
+lumaCanvas.width = 32;
+lumaCanvas.height = 32;
+const lumaCtx = lumaCanvas.getContext('2d', { willReadFrequently: true });
+
 async function init() {
     const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm"
     );
-    
+
     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
         baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
@@ -48,10 +56,9 @@ async function init() {
     video.addEventListener('loadeddata', loop);
 }
 
-// 3. Motore di rendering topologico
 function drawFaceMeshSegments(landmarks) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
+
     const drawPath = (indices, color, closePath = false) => {
         ctx.beginPath();
         ctx.strokeStyle = color;
@@ -67,7 +74,6 @@ function drawFaceMeshSegments(landmarks) {
         ctx.stroke();
     };
 
-    // Rendering vettoriale delle aree di interesse
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows, 'rgba(43, 87, 151, 0.8)');
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye, 'rgba(0, 180, 0, 0.8)', true);
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye, 'rgba(0, 180, 0, 0.8)', true);
@@ -75,7 +81,6 @@ function drawFaceMeshSegments(landmarks) {
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.innerLips, 'rgba(185, 29, 71, 0.8)', true);
 }
 
-// 4. Ciclo di elaborazione principale (Event Loop)
 async function loop() {
     const ts = performance.now();
 
@@ -83,31 +88,66 @@ async function loop() {
         const dtSec = (ts - lastFrameTimeMs) / 1000.0;
         lastFrameTimeMs = ts;
         lastVideoTime = video.currentTime;
-        
+
+        const dtSecClamped = Math.min(dtSec, 0.1);
+
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
-        
+
         const results = faceLandmarker.detectForVideo(video, ts);
 
         if (results.faceLandmarks && results.faceLandmarks.length > 0) {
             const landmarks = results.faceLandmarks[0];
             drawFaceMeshSegments(landmarks);
-            
-            // Gestione Sguardo
-            currentNormalizedIris = GazeEstimator.getRobustGazeVector(landmarks);
-            
+
+            // 1. Estrazione metriche fisiologiche primarie
+            const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
+            if (!rawMetrics) {
+                requestAnimationFrame(loop);
+                return;
+            }
+
+            // 2. Estrazione dati ambientali e rotazione testa (Nuovi parametri)
+            const dx = landmarks[263].x - landmarks[33].x;
+            const dy = landmarks[263].y - landmarks[33].y;
+            const dzYaw = landmarks[263].z - landmarks[33].z;
+
+            const roll = Math.atan2(dy, dx) * (180 / Math.PI);
+            const yaw = Math.atan2(dzYaw, dx) * (180 / Math.PI);
+
+            const dyPitch = landmarks[152].y - landmarks[10].y;
+            const dzPitch = landmarks[152].z - landmarks[10].z;
+            const pitch = Math.atan2(dzPitch, dyPitch) * (180 / Math.PI);
+
+            // Calcolo veloce luminosità ambientale (Luma)
+            lumaCtx.drawImage(video, 0, 0, 32, 32);
+            const lumaData = lumaCtx.getImageData(0, 0, 32, 32).data;
+            let lumaSum = 0;
+            for (let i = 0; i < lumaData.length; i += 4) {
+                lumaSum += (lumaData[i] * 0.299 + lumaData[i + 1] * 0.587 + lumaData[i + 2] * 0.114);
+            }
+            const averageLuma = lumaSum / 1024; // Valore 0 (Buio) -> 255 (Luce)
+
+            // 3. Gestione Sguardo con Depth Correction
+            currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
+
             if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
-                const rawPos = gazeCalibrator.predict(currentNormalizedIris.x, currentNormalizedIris.y);
+                // Depth Correction: compensa il movimento avanti/indietro rispetto alla calibrazione (~0.20)
+                const depthScale = 0.20 / rawMetrics.iod;
+                const depthCorrectedX = currentNormalizedIris.x * depthScale;
+                const depthCorrectedY = currentNormalizedIris.y * depthScale;
+
+                const rawPos = gazeCalibrator.predict(depthCorrectedX, depthCorrectedY);
                 const smoothPos = uiFilter.filter(rawPos.x, rawPos.y, ts);
-                
+
+                currentSmoothPos = smoothPos;
+
                 gazeDot.style.left = `${smoothPos.x}px`;
                 gazeDot.style.top = `${smoothPos.y}px`;
                 document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
             }
 
-            // Gestione Emotiva
-            const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
-
+            // 4. Gestione Emotiva
             if (emotionAnalyzer.isCalibrating) {
                 const done = emotionAnalyzer.processCalibrationSample(rawMetrics);
                 if (done) {
@@ -115,8 +155,8 @@ async function loop() {
                     document.getElementById('val-status').innerText = "Calibrazione completata. Rilevamento attivo.";
                 }
             } else if (emotionAnalyzer.isCalibrated) {
-                const state = emotionAnalyzer.update(rawMetrics, dtSec);
-                
+                const state = emotionAnalyzer.update(rawMetrics, dtSecClamped);
+
                 document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                 document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
                 document.getElementById('val-lip').innerText = `${state.zLip.toFixed(2)} σ`;
@@ -129,15 +169,39 @@ async function loop() {
                     cardStatus.classList.remove('alert');
                     document.getElementById('val-status').innerText = `Normale (${state.stressPercentage.toFixed(0)}%)`;
                 }
+
+                if (gazeCalibrator.regressionModel) {
+                    // Export massivo di tutti i dati per l'analisi
+                    sessionData.push({
+                        timestamp: ts.toFixed(2),
+                        dtSec: dtSecClamped.toFixed(4),
+                        iod: rawMetrics.iod.toFixed(4),
+                        headPitch: pitch.toFixed(2),
+                        headYaw: yaw.toFixed(2),
+                        headRoll: roll.toFixed(2),
+                        envLuma: averageLuma.toFixed(2),
+                        rawGazeX: currentNormalizedIris.x.toFixed(4),
+                        rawGazeY: currentNormalizedIris.y.toFixed(4),
+                        smoothGazeX: currentSmoothPos.x.toFixed(2),
+                        smoothGazeY: currentSmoothPos.y.toFixed(2),
+                        rawAU4: rawMetrics.corrugator.toFixed(4),
+                        rawEar: rawMetrics.ear.toFixed(4),
+                        rawLip: rawMetrics.lipPress.toFixed(4),
+                        zAU4: state.zCorrugator.toFixed(2),
+                        zEar: state.zEar.toFixed(2),
+                        zLip: state.zLip.toFixed(2),
+                        stressDelta: state.stressDelta.toFixed(4),
+                        stressPercentage: state.stressPercentage.toFixed(2),
+                        isFrustrated: state.isFrustrated ? 1 : 0
+                    });
+                }
             }
         }
     }
     requestAnimationFrame(loop);
 }
 
-// 5. Inizializzazione sicura ancorata al DOM
 document.addEventListener("DOMContentLoaded", () => {
-    // Acquisizione riferimenti fisici post-rendering
     video = document.getElementById('webcam');
     canvas = document.getElementById('output-canvas');
     ctx = canvas.getContext('2d');
@@ -147,15 +211,15 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCalEmotion = document.getElementById('btn-cal-emotion');
     calOverlay = document.getElementById('cal-overlay');
 
-    // Validazione strutturale
     if (!btnCalGaze || !btnCalEmotion) {
         console.error("ERRORE ARCHITETTURALE: Nodi DOM mancanti. Assicurarsi che il file index.html sia aggiornato e la cache del browser svuotata.");
         return;
     }
 
-    // Configurazione Event Listeners con inibizione del focus (blur)
     btnCalGaze.onclick = () => {
         btnCalGaze.blur();
+        gazeCalibrator.reset();
+        uiFilter.reset();
         isGazeCalibrating = true;
         calibrationUI.start();
     };
@@ -167,9 +231,35 @@ document.addEventListener("DOMContentLoaded", () => {
         emotionAnalyzer.startCalibration();
     };
 
+    const btnExport = document.getElementById('btn-export');
+    if (btnExport) {
+        btnExport.onclick = () => {
+            btnExport.blur();
+
+            if (sessionData.length === 0) {
+                alert("Nessun dato registrato. Esegui prima le calibrazioni.");
+                return;
+            }
+
+            const headers = Object.keys(sessionData[0]).join(",");
+            const rows = sessionData.map(row => Object.values(row).join(",")).join("\n");
+            const csvContent = "data:text/csv;charset=utf-8," + headers + "\n" + rows;
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "aura_test_data.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+    } else {
+        console.warn("Bottone Export non trovato.");
+    }
+
     window.addEventListener('keydown', (e) => {
         if (e.code === 'Space' && isGazeCalibrating) {
-            e.preventDefault(); // Previene lo scroll della pagina
+            e.preventDefault();
             if (!e.repeat && currentNormalizedIris) {
                 const target = calibrationUI.getNextPointCoords();
                 gazeCalibrator.recordDataPoint(currentNormalizedIris.x, currentNormalizedIris.y, target.x, target.y);
@@ -178,6 +268,5 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    // Avvio della pipeline computazionale
     init();
 });

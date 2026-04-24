@@ -1,49 +1,168 @@
 <!DOCTYPE html>
 <html lang="it">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Aura MVP - Controller Sensoriale Avanzato</title>
     <style>
-        :root { --primary: #2b5797; --error: #b91d47; --bg: #f4f6f9; --surface: #ffffff; }
-        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #1e293b; }
-        
-        .dashboard-layout { display: flex; gap: 24px; max-width: 1200px; margin: 0 auto; align-items: flex-start; }
-        
-        .main-panel { flex: 2; background: var(--surface); padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-        .sidebar { flex: 1; display: flex; flex-direction: column; gap: 16px; }
-        
-        .header-controls { display: flex; gap: 10px; margin-bottom: 20px; }
-        button { padding: 10px 16px; background: var(--primary); color: white; border: none; border-radius: 4px; font-weight: 600; cursor: pointer; }
-        button:disabled { opacity: 0.6; cursor: not-allowed; }
-        
-        .video-container { position: relative; width: 100%; border-radius: 6px; overflow: hidden; background: #000; aspect-ratio: 4/3; }
-        video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
-        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
-        
-        .data-card { background: var(--surface); padding: 16px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-left: 4px solid var(--primary); }
-        .data-card.alert { border-left-color: var(--error); background-color: #fdf2f2; }
-        .data-title { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; margin-bottom: 8px; font-weight: 700; }
-        .data-value { font-size: 1.25rem; font-family: monospace; font-weight: 600; }
-        
-        #gaze-dot { position: fixed; width: 12px; height: 12px; background: var(--error); border: 2px solid white; border-radius: 50%; pointer-events: none; z-index: 10000; display: none; transform: translate(-50%, -50%); }
-        .calibration-overlay { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 8px 12px; border-radius: 4px; font-family: monospace; display: none; z-index: 10; }
+        :root {
+            --primary: #2b5797;
+            --error: #b91d47;
+            --bg: #f4f6f9;
+            --surface: #ffffff;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            margin: 0;
+            padding: 20px;
+            color: #1e293b;
+        }
+
+        .dashboard-layout {
+            display: flex;
+            gap: 24px;
+            max-width: 1200px;
+            margin: 0 auto;
+            align-items: flex-start;
+        }
+
+        .main-panel {
+            flex: 2;
+            background: var(--surface);
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        .sidebar {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            padding: 10px 16px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            border-radius: 6px;
+            overflow: hidden;
+            background: #000;
+            aspect-ratio: 4/3;
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1);
+            pointer-events: none;
+        }
+
+        .data-card {
+            background: var(--surface);
+            padding: 16px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            border-left: 4px solid var(--primary);
+        }
+
+        .data-card.alert {
+            border-left-color: var(--error);
+            background-color: #fdf2f2;
+        }
+
+        .data-title {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #64748b;
+            margin-bottom: 8px;
+            font-weight: 700;
+        }
+
+        .data-value {
+            font-size: 1.25rem;
+            font-family: monospace;
+            font-weight: 600;
+        }
+
+        #gaze-dot {
+            position: fixed;
+            width: 12px;
+            height: 12px;
+            background: var(--error);
+            border: 2px solid white;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 10000;
+            display: none;
+            transform: translate(-50%, -50%);
+        }
+
+        .calibration-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-family: monospace;
+            display: none;
+            z-index: 10;
+        }
     </style>
 </head>
+
 <body>
     <div id="gaze-dot"></div>
-    
+
     <div class="dashboard-layout">
         <div class="main-panel">
             <div class="header-controls">
                 <button id="btn-cal-gaze">1. Calibrazione Sguardo</button>
                 <button id="btn-cal-emotion">2. Calibrazione Emotiva (Viso Neutro)</button>
+                <button id="btn-export" style="background: #10b981;">3. Scarica Dati Test (CSV)</button>
             </div>
-            
+
             <div class="video-container">
                 <video id="webcam" autoplay playsinline></video>
                 <canvas id="output-canvas"></canvas>
-                <div id="cal-overlay" class="calibration-overlay">Acquisizione Baseline... Mantenere espressione neutra.</div>
+                <div id="cal-overlay" class="calibration-overlay">Acquisizione Baseline... Mantenere espressione neutra.
+                </div>
             </div>
         </div>
 
@@ -80,4 +199,5 @@
     </script>
     <script type="module" src="./src/main.js"></script>
 </body>
+
 </html>
