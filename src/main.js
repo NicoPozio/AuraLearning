@@ -1,16 +1,18 @@
 import { FilesetResolver, FaceLandmarker } from "@mediapipe/tasks-vision";
 import { GazeEstimator } from "./sensors/GazeEstimator.js";
 import { FaceMetricsExtractor } from "./sensors/FaceMetricsExtractor.js";
-import { FrustrationAnalyzer } from "./analysis/FrustrationAnalyzer.js";
+import { AffectAnalyzer } from "./analysis/AffectAnalyzer.js";
 import { GazeCalibrator } from "./calibration/GazeCalibrator.js";
 import { CalibrationUI } from "./calibration/CalibrationUI.js";
 import { OneEuroFilter } from "./utils/OneEuroFilter.js";
+import { VoiceInput } from "./sensors/VoiceInput.js"; // <-- NUOVO IMPORT
 
 let video, canvas, ctx, gazeDot;
 let btnCalGaze, btnCalEmotion, calOverlay;
 
 let sessionData = [];
 let currentSmoothPos = { x: 0, y: 0 };
+let currentFinalTranscript = ""; // <-- Variabile per salvare l'ultima frase nel CSV
 
 let faceLandmarker;
 let lastVideoTime = -1;
@@ -18,14 +20,14 @@ let lastFrameTimeMs = performance.now();
 let isGazeCalibrating = false;
 let currentNormalizedIris = null;
 
-const emotionAnalyzer = new FrustrationAnalyzer();
+const affectAnalyzer = new AffectAnalyzer();
 const gazeCalibrator = new GazeCalibrator();
 const uiFilter = new OneEuroFilter(60, 0.1, 0.001, 1.0);
 const gazeEstimator = new GazeEstimator();
 
 let calibrationUI;
+let voiceInput; // <-- Istanza globale
 
-// Canvas off-screen per il calcolo ultra-veloce della luminosità ambientale
 const lumaCanvas = document.createElement('canvas');
 lumaCanvas.width = 32;
 lumaCanvas.height = 32;
@@ -51,14 +53,31 @@ async function init() {
         gazeDot.style.display = 'block';
     });
 
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    // ─── INIZIALIZZAZIONE MODULO VOCALE ───
+    voiceInput = new VoiceInput((interim, final) => {
+        const voiceDiv = document.getElementById('val-voice');
+        if (final) {
+            currentFinalTranscript = final.trim();
+            voiceDiv.innerHTML = `<span style="color: #0f172a; font-weight: 600;">${final}</span>`;
+            // Resetta la frase dopo 3 secondi nel CSV per non duplicarla all'infinito
+            setTimeout(() => { if (currentFinalTranscript === final.trim()) currentFinalTranscript = ""; }, 3000);
+        } else if (interim) {
+            voiceDiv.innerHTML = `<span style="font-style: italic;">${interim}...</span>`;
+        }
+    }, (statusMessage) => {
+        document.getElementById('voice-status').innerText = statusMessage;
+    });
+
+    // Avvia l'ascolto appena la webcam è pronta
+    voiceInput.start();
+
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: true }); // Aggiunto audio: true
     video.srcObject = stream;
     video.addEventListener('loadeddata', loop);
 }
 
 function drawFaceMeshSegments(landmarks) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
     const drawPath = (indices, color, closePath = false) => {
         ctx.beginPath();
         ctx.strokeStyle = color;
@@ -100,14 +119,12 @@ async function loop() {
             const landmarks = results.faceLandmarks[0];
             drawFaceMeshSegments(landmarks);
 
-            // 1. Estrazione metriche fisiologiche primarie
             const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
             if (!rawMetrics) {
                 requestAnimationFrame(loop);
                 return;
             }
 
-            // 2. Estrazione dati ambientali e rotazione testa (Nuovi parametri)
             const dx = landmarks[263].x - landmarks[33].x;
             const dy = landmarks[263].y - landmarks[33].y;
             const dzYaw = landmarks[263].z - landmarks[33].z;
@@ -119,20 +136,17 @@ async function loop() {
             const dzPitch = landmarks[152].z - landmarks[10].z;
             const pitch = Math.atan2(dzPitch, dyPitch) * (180 / Math.PI);
 
-            // Calcolo veloce luminosità ambientale (Luma)
             lumaCtx.drawImage(video, 0, 0, 32, 32);
             const lumaData = lumaCtx.getImageData(0, 0, 32, 32).data;
             let lumaSum = 0;
             for (let i = 0; i < lumaData.length; i += 4) {
                 lumaSum += (lumaData[i] * 0.299 + lumaData[i + 1] * 0.587 + lumaData[i + 2] * 0.114);
             }
-            const averageLuma = lumaSum / 1024; // Valore 0 (Buio) -> 255 (Luce)
+            const averageLuma = lumaSum / 1024;
 
-            // 3. Gestione Sguardo con Depth Correction
             currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
 
             if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
-                // Depth Correction: compensa il movimento avanti/indietro rispetto alla calibrazione (~0.20)
                 const depthScale = 0.20 / rawMetrics.iod;
                 const depthCorrectedX = currentNormalizedIris.x * depthScale;
                 const depthCorrectedY = currentNormalizedIris.y * depthScale;
@@ -147,52 +161,53 @@ async function loop() {
                 document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
             }
 
-            // 4. Gestione Emotiva
-            if (emotionAnalyzer.isCalibrating) {
-                const done = emotionAnalyzer.processCalibrationSample(rawMetrics);
+            if (affectAnalyzer.isCalibrating) {
+                const done = affectAnalyzer.processCalibrationSample(rawMetrics);
                 if (done) {
                     calOverlay.style.display = 'none';
                     document.getElementById('val-status').innerText = "Calibrazione completata. Rilevamento attivo.";
                 }
-            } else if (emotionAnalyzer.isCalibrated) {
-                const state = emotionAnalyzer.update(rawMetrics, dtSecClamped);
+            } else if (affectAnalyzer.isCalibrated) {
+                const state = affectAnalyzer.update(rawMetrics, dtSecClamped);
 
                 document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                 document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
-                document.getElementById('val-lip').innerText = `${state.zLip.toFixed(2)} σ`;
+                document.getElementById('val-asym').innerText = `${rawMetrics.browAsymmetry.toFixed(3)}`;
 
                 const cardStatus = document.getElementById('card-status');
-                if (state.isFrustrated) {
+                cardStatus.classList.remove('alert', 'warning', 'info');
+                
+                if (state.isSpeaking) {
+                    cardStatus.classList.add('info');
+                    document.getElementById('val-status').innerText = "VAD: Movimento Labiale...";
+                } else if (state.isFrustrated) {
                     cardStatus.classList.add('alert');
                     document.getElementById('val-status').innerText = `SOVRACCARICO (${state.stressPercentage.toFixed(0)}%)`;
+                } else if (state.isConfused) {
+                    cardStatus.classList.add('warning');
+                    document.getElementById('val-status').innerText = `CONFUSIONE RILEVATA`;
+                } else if (state.isBored) {
+                    cardStatus.classList.add('info');
+                    document.getElementById('val-status').innerText = `NOIA (${state.boredomPercentage.toFixed(0)}%)`;
                 } else {
-                    cardStatus.classList.remove('alert');
-                    document.getElementById('val-status').innerText = `Normale (${state.stressPercentage.toFixed(0)}%)`;
+                    document.getElementById('val-status').innerText = `Attivo e Regolare (${state.stressPercentage.toFixed(0)}%)`;
                 }
 
                 if (gazeCalibrator.regressionModel) {
-                    // Export massivo di tutti i dati per l'analisi
                     sessionData.push({
                         timestamp: ts.toFixed(2),
                         dtSec: dtSecClamped.toFixed(4),
-                        iod: rawMetrics.iod.toFixed(4),
-                        headPitch: pitch.toFixed(2),
-                        headYaw: yaw.toFixed(2),
-                        headRoll: roll.toFixed(2),
-                        envLuma: averageLuma.toFixed(2),
-                        rawGazeX: currentNormalizedIris.x.toFixed(4),
-                        rawGazeY: currentNormalizedIris.y.toFixed(4),
                         smoothGazeX: currentSmoothPos.x.toFixed(2),
                         smoothGazeY: currentSmoothPos.y.toFixed(2),
-                        rawAU4: rawMetrics.corrugator.toFixed(4),
-                        rawEar: rawMetrics.ear.toFixed(4),
-                        rawLip: rawMetrics.lipPress.toFixed(4),
                         zAU4: state.zCorrugator.toFixed(2),
                         zEar: state.zEar.toFixed(2),
-                        zLip: state.zLip.toFixed(2),
-                        stressDelta: state.stressDelta.toFixed(4),
                         stressPercentage: state.stressPercentage.toFixed(2),
-                        isFrustrated: state.isFrustrated ? 1 : 0
+                        boredomPercentage: state.boredomPercentage.toFixed(2),
+                        isFrustrated: state.isFrustrated ? 1 : 0,
+                        isBored: state.isBored ? 1 : 0,
+                        isConfused: state.isConfused ? 1 : 0,
+                        isSpeaking: state.isSpeaking ? 1 : 0,
+                        spokenText: currentFinalTranscript // <-- NUOVO: Esportazione della frase pronunciata
                     });
                 }
             }
@@ -211,11 +226,6 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCalEmotion = document.getElementById('btn-cal-emotion');
     calOverlay = document.getElementById('cal-overlay');
 
-    if (!btnCalGaze || !btnCalEmotion) {
-        console.error("ERRORE ARCHITETTURALE: Nodi DOM mancanti. Assicurarsi che il file index.html sia aggiornato e la cache del browser svuotata.");
-        return;
-    }
-
     btnCalGaze.onclick = () => {
         btnCalGaze.blur();
         gazeCalibrator.reset();
@@ -228,23 +238,25 @@ document.addEventListener("DOMContentLoaded", () => {
         btnCalEmotion.blur();
         calOverlay.style.display = 'block';
         document.getElementById('val-status').innerText = "Acquisizione Baseline...";
-        emotionAnalyzer.startCalibration();
+        affectAnalyzer.startCalibration();
     };
 
     const btnExport = document.getElementById('btn-export');
     if (btnExport) {
         btnExport.onclick = () => {
             btnExport.blur();
-
             if (sessionData.length === 0) {
                 alert("Nessun dato registrato. Esegui prima le calibrazioni.");
                 return;
             }
-
             const headers = Object.keys(sessionData[0]).join(",");
-            const rows = sessionData.map(row => Object.values(row).join(",")).join("\n");
+            const rows = sessionData.map(row => {
+                // Sostituisce le virgole nelle frasi parlate con un punto e virgola per non rompere il CSV
+                if (row.spokenText) row.spokenText = row.spokenText.replace(/,/g, ';');
+                return Object.values(row).join(",");
+            }).join("\n");
+            
             const csvContent = "data:text/csv;charset=utf-8," + headers + "\n" + rows;
-
             const encodedUri = encodeURI(csvContent);
             const link = document.createElement("a");
             link.setAttribute("href", encodedUri);
@@ -253,8 +265,6 @@ document.addEventListener("DOMContentLoaded", () => {
             link.click();
             document.body.removeChild(link);
         };
-    } else {
-        console.warn("Bottone Export non trovato.");
     }
 
     window.addEventListener('keydown', (e) => {

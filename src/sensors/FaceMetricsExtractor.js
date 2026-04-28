@@ -2,7 +2,6 @@ export class FaceMetricsExtractor {
     static LEFT_INNER_BROW = 55;
     static RIGHT_INNER_BROW = 285;
 
-    // Punti centrali (pupille/iridi stimati) per il calcolo verticale
     static LEFT_EYE_CENTER = 468;
     static RIGHT_EYE_CENTER = 473;
 
@@ -23,6 +22,9 @@ export class FaceMetricsExtractor {
     static LIP_UPPER_INNER = 13;
     static LIP_LOWER_INNER = 14;
 
+    static NOSE_TIP = 1;
+
+    // Struttura dati per il rendering grafico sul Canvas (Ripristinata)
     static RENDER_SEGMENTS = {
         brows: [46, 53, 52, 65, 55, 285, 295, 282, 283, 276],
         leftEye: [33, 160, 158, 133, 153, 144, 33],
@@ -36,7 +38,6 @@ export class FaceMetricsExtractor {
     }
 
     static extractRawMetrics(landmarks) {
-        // Fallback robusto se MediaPipe perde momentaneamente dei punti
         if (!landmarks || landmarks.length < 478) return null;
 
         const iod = this._dist(
@@ -46,9 +47,6 @@ export class FaceMetricsExtractor {
 
         if (iod < 1e-5) return null;
 
-        // --- NUOVO CALCOLO ROBUSTO AU4 (Corrugatore) ---
-        // Invece di misurare orizzontalmente (vulnerabile alle ombre asimmetriche),
-        // misuriamo quanto le sopracciglia si ABBASSANO rispetto al centro dell'occhio.
         const leftBrowDrop = this._dist(
             landmarks[this.LEFT_INNER_BROW],
             landmarks[this.LEFT_EYE_CENTER]
@@ -58,11 +56,13 @@ export class FaceMetricsExtractor {
             landmarks[this.RIGHT_EYE_CENTER]
         );
 
-        // AU4: media della distanza verticale occhio-sopracciglio / iod
-        // Quando ti arrabbi, il sopracciglio scende, la distanza DIMINUISCE.
+        // AU4: Contrazione del corrugatore (media bilanciata)
         const corrugator = ((leftBrowDrop + rightBrowDrop) / 2) / iod;
 
-        // --- EAR (Ammiccamento / Squint) ---
+        // Estrazione dell'Asimmetria (Fondamentale per identificare la Confusione)
+        const browAsymmetry = Math.abs(leftBrowDrop - rightBrowDrop) / iod;
+
+        // EAR (Ammiccamento / Squint)
         const lEyeH = this._dist(landmarks[this.L_EYE_TOP], landmarks[this.L_EYE_BOTTOM]);
         const lEyeW = this._dist(landmarks[this.L_EYE_INNER], landmarks[this.LEFT_OUTER_EYE]);
         const rEyeH = this._dist(landmarks[this.R_EYE_TOP], landmarks[this.R_EYE_BOTTOM]);
@@ -72,11 +72,22 @@ export class FaceMetricsExtractor {
         const earRight = rEyeW > 1e-5 ? rEyeH / rEyeW : 0;
         const ear = (earLeft + earRight) / 2;
 
-        // --- LIP PRESS (Labbra serrate) ---
+        // LIP PRESS (Labbra serrate / Rilevamento empirico di movimento vocale)
         const outerLipH = this._dist(landmarks[this.LIP_UPPER_OUTER], landmarks[this.LIP_LOWER_OUTER]);
         const innerLipH = this._dist(landmarks[this.LIP_UPPER_INNER], landmarks[this.LIP_LOWER_INNER]);
         const lipPress = outerLipH > 1e-5 ? innerLipH / outerLipH : 0;
 
-        return { corrugator, ear, lipPress, iod };
+        // Estrazione coordinate nasali per analisi postura temporale nel dominio della noia
+        const noseTip = landmarks[this.NOSE_TIP];
+
+        return { 
+            corrugator, 
+            ear, 
+            lipPress, 
+            iod, 
+            browAsymmetry,
+            noseX: noseTip.x,
+            noseY: noseTip.y 
+        };
     }
 }
