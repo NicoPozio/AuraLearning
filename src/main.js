@@ -6,6 +6,7 @@ import { GazeCalibrator } from "./calibration/GazeCalibrator.js";
 import { CalibrationUI } from "./calibration/CalibrationUI.js";
 import { OneEuroFilter } from "./utils/OneEuroFilter.js";
 import { VoiceInput } from "./sensors/VoiceInput.js"; // <-- NUOVO IMPORT
+import { ECAController } from "./eca/ECAController.js";
 
 let video, canvas, ctx, gazeDot;
 let btnCalGaze, btnCalEmotion, calOverlay;
@@ -21,6 +22,7 @@ let isGazeCalibrating = false;
 let currentNormalizedIris = null;
 
 const affectAnalyzer = new AffectAnalyzer();
+const eca = new ECAController('eca-container');
 const gazeCalibrator = new GazeCalibrator();
 const uiFilter = new OneEuroFilter(60, 0.1, 0.001, 1.0);
 const gazeEstimator = new GazeEstimator();
@@ -71,6 +73,14 @@ async function init() {
     // Avvia l'ascolto appena la webcam è pronta
     voiceInput.start();
 
+    // ─── CARICAMENTO MODELLO 3D (ECA) ───
+    try {
+        await eca.loadModel('./models/avatar.glb');
+        console.log("Modello 3D caricato con successo!");
+    } catch (error) {
+        console.error("Errore durante il caricamento del modello 3D:", error);
+    }
+
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: true }); // Aggiunto audio: true
     video.srcObject = stream;
     video.addEventListener('loadeddata', loop);
@@ -109,6 +119,10 @@ async function loop() {
         lastVideoTime = video.currentTime;
 
         const dtSecClamped = Math.min(dtSec, 0.1);
+
+        // --- CHIAMATA DI AGGIORNAMENTO ECA ---
+        eca.update(dtSecClamped);
+        // -------------------------------------
 
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -176,7 +190,7 @@ async function loop() {
 
                 const cardStatus = document.getElementById('card-status');
                 cardStatus.classList.remove('alert', 'warning', 'info');
-                
+
                 if (state.isSpeaking) {
                     cardStatus.classList.add('info');
                     document.getElementById('val-status').innerText = "VAD: Movimento Labiale...";
@@ -255,7 +269,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (row.spokenText) row.spokenText = row.spokenText.replace(/,/g, ';');
                 return Object.values(row).join(",");
             }).join("\n");
-            
+
             const csvContent = "data:text/csv;charset=utf-8," + headers + "\n" + rows;
             const encodedUri = encodeURI(csvContent);
             const link = document.createElement("a");
@@ -276,6 +290,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 calibrationUI.advance();
             }
         }
+
+        // --- NUOVO: Tasto 'T' per testare il Lip-Sync ---
+        if (e.code === 'KeyT') {
+            eca.speak("Ciao! Sono il tuo assistente Aura. Sto testando il movimento della mia bocca in tempo reale.");
+        }
+        // ------------------------------------------------
     });
 
     init();

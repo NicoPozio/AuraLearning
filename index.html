@@ -180,17 +180,25 @@
         </div>
 
         <div class="sidebar">
+            <div class="data-card" style="padding: 0; overflow: hidden; height: 300px; position: relative;">
+                <div id="eca-container" style="width: 100%; height: 100%; background: #e2e8f0;"></div>
+                <div id="eca-status"
+                    style="position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.6); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem;">
+                    ECA Offline</div>
+            </div>
+
             <div class="data-card" id="card-status">
                 <div class="data-title">Stato Cognitivo (Modello Integrativo)</div>
                 <div class="data-value" id="val-status" style="font-size: 1.1rem;">In attesa di calibrazione...</div>
             </div>
-            
+
             <div class="data-card" style="border-left-color: #8b5cf6;">
                 <div class="data-title" style="display: flex; justify-content: space-between;">
                     <span>Input Vocale (STT)</span>
                     <span id="voice-status" style="color: #8b5cf6; font-size: 0.75rem;">Spento</span>
                 </div>
-                <div class="data-value" id="val-voice" style="font-size: 1rem; font-weight: 400; min-height: 48px; color: #475569;">
+                <div class="data-value" id="val-voice"
+                    style="font-size: 1rem; font-weight: 400; min-height: 48px; color: #475569;">
                     In attesa di input...
                 </div>
             </div>
@@ -215,12 +223,14 @@
     </div>
 
     <script type="importmap">
-        {
-            "imports": {
-                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs"
+            {
+                "imports": {
+                    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs",
+                    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+                }
             }
-        }
-    </script>
+        </script>
     <script type="module" src="./src/main.js"></script>
 </body>
 
