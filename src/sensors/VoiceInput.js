@@ -1,15 +1,15 @@
 export class VoiceInput {
     constructor(onTranscript, onStatusChange) {
         this.onTranscript = onTranscript;
-        this.onStatusChange = onStatusChange || (() => {});
-        
+        this.onStatusChange = onStatusChange || (() => { });
+
         this.isListening = false;
         this.shouldRestart = true;
         this.recognition = null;
 
         // Verifica il supporto cross-browser
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        
+
         if (!SpeechRecognition) {
             console.error("Web Speech API non supportata da questo browser.");
             this.onStatusChange("Errore: STT non supportato dal browser.");

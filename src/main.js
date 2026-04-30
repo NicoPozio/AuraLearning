@@ -291,11 +291,19 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         }
 
-        // --- NUOVO: Tasto 'T' per testare il Lip-Sync ---
+        // --- TASTI DI DEBUG PER GLI STATI DELL'ECA ---
         if (e.code === 'KeyT') {
-            eca.speak("Ciao! Sono il tuo assistente Aura. Sto testando il movimento della mia bocca in tempo reale.");
+            eca.speak("Ciao! Sono il tuo assistente Aura. Sto testando il movimento della mia bocca.");
         }
-        // ------------------------------------------------
+        if (e.code === 'KeyI') {
+            eca.setState('IDLE');
+        }
+        if (e.code === 'KeyL') {
+            eca.setState('LISTENING');
+        }
+        if (e.code === 'KeyP') {
+            eca.setState('THINKING');
+        }
     });
 
     init();

@@ -157,6 +157,21 @@
             display: none;
             z-index: 10;
         }
+
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 4px solid rgba(43, 87, 151, 0.2);
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
     </style>
 </head>
 
@@ -174,7 +189,8 @@
             <div class="video-container">
                 <video id="webcam" autoplay playsinline></video>
                 <canvas id="output-canvas"></canvas>
-                <div id="cal-overlay" class="calibration-overlay">Acquisizione Baseline... Mantenere espressione neutra.
+                <div id="cal-overlay" class="calibration-overlay">
+                    Acquisizione Baseline... Mantenere espressione neutra.
                 </div>
             </div>
         </div>
@@ -182,9 +198,16 @@
         <div class="sidebar">
             <div class="data-card" style="padding: 0; overflow: hidden; height: 300px; position: relative;">
                 <div id="eca-container" style="width: 100%; height: 100%; background: #e2e8f0;"></div>
+
                 <div id="eca-status"
-                    style="position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.6); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem;">
-                    ECA Offline</div>
+                    style="position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.6); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; z-index: 10;">
+                    ECA Offline
+                </div>
+
+                <div id="thinking-spinner"
+                    style="display: none; position: absolute; top: 15px; right: 15px; z-index: 10;">
+                    <div class="spinner"></div>
+                </div>
             </div>
 
             <div class="data-card" id="card-status">
@@ -222,15 +245,18 @@
         </div>
     </div>
 
+    <!-- fflate: richiesto da FBXLoader per decomprimere i file FBX -->
+    <script src="https://unpkg.com/fflate@0.8.2/umd/index.js"></script>
+
     <script type="importmap">
-            {
-                "imports": {
-                    "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs",
-                    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-                    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
-                }
+        {
+            "imports": {
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs",
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
             }
-        </script>
+        }
+    </script>
     <script type="module" src="./src/main.js"></script>
 </body>
 
