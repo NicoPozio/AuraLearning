@@ -40,18 +40,8 @@ export class ECAController {
         this.currentState = 'NONE';
         this.isSpeaking = false;
 
-        this.jawBone = null;
-        this.headBone = null;
-
-        this.faceMesh = null;
-        this.mouthOpenIndex = -1;
-
-        this._idleT = 0;
-
-        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        this.analyser = this.audioContext.createAnalyser();
-        this.analyser.fftSize = 256;
-        this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+        this.currentAudio = new Audio();
+        this.currentAudio.crossOrigin = "anonymous";
 
         window.addEventListener('resize', () => this.onWindowResize());
     }
@@ -113,35 +103,13 @@ export class ECAController {
 
         this.mixer = new THREE.AnimationMixer(this.model);
 
-        // --- NUOVO: EVENTO FINE ANIMAZIONE ---
-        // Questo listener scatta quando un'animazione non in loop finisce.
-        this.mixer.addEventListener('finished', (e) => {
-            // Se l'animazione che ha finito è quella del parlato, e l'audio sta ancora andando...
-            if (e.action === this.actions['SPEAKING'] && this.isSpeaking) {
-                // Sfumiamo dolcemente il corpo verso la posa IDLE
-                this.actions['SPEAKING'].fadeOut(0.4);
-                this.actions['IDLE'].reset().fadeIn(0.4).play();
-                this.currentAction = this.actions['IDLE'];
-            }
-        });
-
         let eyebrows = [];
+        let headBone = null;
 
         this.model.traverse((child) => {
             if (child.isMesh) {
                 child.castShadow = true;
                 child.receiveShadow = true;
-
-                if (child.morphTargetDictionary) {
-                    this.faceMesh = child;
-                    const keys = Object.keys(child.morphTargetDictionary);
-                    for (let key of keys) {
-                        if (key.toLowerCase().includes('mouth') || key.toLowerCase().includes('jaw') || key.toLowerCase() === 'a') {
-                            this.mouthOpenIndex = child.morphTargetDictionary[key];
-                            break;
-                        }
-                    }
-                }
 
                 if (child.name.toLowerCase().includes('eyebrow')) {
                     eyebrows.push(child);
@@ -180,20 +148,14 @@ export class ECAController {
 
             if (child.isBone) {
                 const n = child.name.toLowerCase();
-
-                if (n.includes('jaw')) {
-                    this.jawBone = child;
-                }
-                if (n === 'mixamorighead' || n === 'head') {
-                    this.headBone = child;
-                }
+                if (n === 'mixamorighead' || n === 'head') headBone = child;
             }
         });
 
-        if (this.headBone && eyebrows.length > 0) {
+        if (headBone && eyebrows.length > 0) {
             eyebrows.forEach(eb => {
                 eb.isSkinnedMesh = false;
-                this.headBone.attach(eb);
+                headBone.attach(eb);
             });
         }
 
@@ -213,16 +175,11 @@ export class ECAController {
                     const clip = animFbx.animations[0];
                     const action = this.mixer.clipAction(clip);
 
-                    // --- NUOVA LOGICA DEI LOOP ---
-                    if (state === 'SPEAKING') {
-                        // Se è l'animazione di parlato, la esegue 1 SOLA VOLTA e si ferma
-                        action.setLoop(THREE.LoopOnce, 1);
-                        action.clampWhenFinished = true;
-                    } else {
-                        // Tutte le altre (Idle, Thinking) vanno in loop all'infinito
-                        action.setLoop(THREE.LoopRepeat, Infinity);
-                        action.clampWhenFinished = false;
-                    }
+                    // --- RISOLTO PROBLEMA ANIMAZIONE CHE SI FERMA ---
+                    // Ora TUTTE le animazioni (inclusa SPEAKING) andranno in loop infinito
+                    // Sarà la funzione speak() a fermarla esattamente quando l'audio si interrompe
+                    action.setLoop(THREE.LoopRepeat, Infinity);
+                    action.clampWhenFinished = false;
 
                     this.actions[state] = action;
                 }
@@ -254,54 +211,85 @@ export class ECAController {
         }
     }
 
-    _updateJawVolumetric() {
-        if (this.isSpeaking) {
-            this.analyser.getByteFrequencyData(this.dataArray);
-            let sum = 0;
-            for (let i = 0; i < this.dataArray.length; i++) sum += this.dataArray[i];
-            const volume = sum / this.dataArray.length;
-
-            if (this.jawBone) {
-                const targetRotation = (volume / 255) * 0.7;
-                this.jawBone.rotation.x = THREE.MathUtils.lerp(this.jawBone.rotation.x, targetRotation, 0.4);
-            } else if (this.faceMesh && this.mouthOpenIndex !== -1) {
-                const targetMorph = (volume / 255) * 1.5;
-                const currentMorph = this.faceMesh.morphTargetInfluences[this.mouthOpenIndex];
-                this.faceMesh.morphTargetInfluences[this.mouthOpenIndex] = THREE.MathUtils.lerp(currentMorph, targetMorph, 0.4);
-            } else if (this.headBone) {
-                const nodAmount = (volume / 255) * 0.4;
-                this.headBone.rotateX(nodAmount);
-            }
-        } else {
-            if (this.jawBone) {
-                this.jawBone.rotation.x = THREE.MathUtils.lerp(this.jawBone.rotation.x, 0, 0.15);
-            } else if (this.faceMesh && this.mouthOpenIndex !== -1) {
-                const currentMorph = this.faceMesh.morphTargetInfluences[this.mouthOpenIndex];
-                this.faceMesh.morphTargetInfluences[this.mouthOpenIndex] = THREE.MathUtils.lerp(currentMorph, 0, 0.2);
-            }
-        }
-    }
-
     update(dtSec) {
         if (this.mixer) this.mixer.update(dtSec);
-        this._updateJawVolumetric();
         this.renderer.render(this.scene, this.camera);
     }
 
-    speak(text) {
-        if (this.audioContext.state === 'suspended') this.audioContext.resume();
+    async speak(text) {
+        if (this.audioContext && this.audioContext.state === 'suspended') this.audioContext.resume();
 
-        window.speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(text);
-        u.lang = 'it-IT';
-        u.rate = 0.95;
-        u.pitch = 1.0;
+        this.currentAudio.pause();
 
-        u.onstart = () => { this.isSpeaking = true; this.setState('SPEAKING'); };
-        u.onend = () => { this.isSpeaking = false; this.setState('IDLE'); };
-        u.onerror = () => { this.isSpeaking = false; this.setState('IDLE'); };
+        const apiKey = 'sk_1d4eb2e9f5320c67c7685115fd9b16a5d47dda948e334a88';
+        const voiceId = 'N2lVS1w4EtoT3dr4eOWO'; // Callum
 
-        window.speechSynthesis.speak(u);
+        try {
+            console.log(`☁️ [AURA] Generazione TTS: "${text}"`);
+
+            const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?optimize_streaming_latency=3`, {
+                method: 'POST',
+                headers: {
+                    'Accept': 'audio/mpeg',
+                    'xi-api-key': apiKey,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    text: text,
+                    model_id: 'eleven_multilingual_v2',
+                    voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+                })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`${response.status} - ${errorData.detail?.message || JSON.stringify(errorData)}`);
+            }
+
+            const blob = await response.blob();
+            const audioUrl = URL.createObjectURL(blob);
+
+            // Pulizia eventi precedenti
+            this.currentAudio.onplay = null;
+            this.currentAudio.onended = null;
+            this.currentAudio.onerror = null;
+
+            this.currentAudio.src = audioUrl;
+
+            return new Promise((resolve) => {
+                this.currentAudio.onplay = () => {
+                    this.isSpeaking = true;
+                    this.setState('SPEAKING');
+                };
+
+                // ECCO LA CORREZIONE: onended invece di onend!
+                this.currentAudio.onended = () => {
+                    this.isSpeaking = false;
+                    this.setState('IDLE');
+                    URL.revokeObjectURL(audioUrl);
+                    resolve();
+                };
+
+                this.currentAudio.onerror = (e) => {
+                    console.error("❌ [AURA] Errore riproduzione audio.");
+                    this.isSpeaking = false;
+                    this.setState('IDLE');
+                    resolve();
+                };
+
+                this.currentAudio.play().catch((err) => {
+                    console.error("❌ Autoplay bloccato dal browser!", err);
+                    this.isSpeaking = false;
+                    this.setState('IDLE');
+                    resolve();
+                });
+            });
+
+        } catch (error) {
+            console.error("❌ [AURA] Fallimento API ElevenLabs:", error);
+            this.isSpeaking = false;
+            this.setState('IDLE');
+        }
     }
 
     onWindowResize() {

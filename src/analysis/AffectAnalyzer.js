@@ -57,10 +57,8 @@ export class AffectAnalyzer {
                 return { mean, std: Math.max(std, minStd) };
             };
 
-            // 1. Bilanciamento Floor Deviazione Standard: valori intermedi per percepire
-            //    le micro-espressioni senza attivarsi per il puro rumore del sensore.
             this.baseline.corrugator = calculateStats('corrugator', 0.008);
-            this.baseline.ear = calculateStats('ear', 0.020);
+            this.baseline.ear = calculateStats('ear', 0.025);
             this.baseline.lipPress = calculateStats('lipPress', 0.010);
             this.baseline.browAsymmetry = calculateStats('browAsymmetry', 0.008);
 
@@ -91,7 +89,9 @@ export class AffectAnalyzer {
         if (this.headPoseHistory.length > 30) {
             const headMeanX = this.headPoseHistory.reduce((a, b) => a + b.x, 0) / this.headPoseHistory.length;
             const headMeanY = this.headPoseHistory.reduce((a, b) => a + b.y, 0) / this.headPoseHistory.length;
-            headVariance = this.headPoseHistory.reduce((a, b) => a + Math.pow(b.x - headMeanX, 2) + Math.pow(b.y - headMeanY, 2), 0) / this.headPoseHistory.length;
+            headVariance = this.headPoseHistory.reduce((a, b) =>
+                a + Math.pow(b.x - headMeanX, 2) + Math.pow(b.y - headMeanY, 2), 0
+            ) / this.headPoseHistory.length;
         }
         const normalizedHeadVar = headVariance / (metrics.iod * metrics.iod + 1e-6);
         const isFaceStatic = normalizedHeadVar < 0.015;
@@ -101,16 +101,28 @@ export class AffectAnalyzer {
         const zLip = (this.baseline.lipPress.mean - metrics.lipPress) / this.baseline.lipPress.std;
         const zAsymmetry = (metrics.browAsymmetry - this.baseline.browAsymmetry.mean) / this.baseline.browAsymmetry.std;
 
-        const poseConfidence = metrics.iod && this.baseline.iod > 0 ? Math.min(1.0, metrics.iod / this.baseline.iod) : 1.0;
+        const poseConfidence = metrics.iod && this.baseline.iod > 0
+            ? Math.min(1.0, metrics.iod / this.baseline.iod)
+            : 1.0;
 
-        // 2. Riduzione Cancelli Z-Score: Ora l'attivazione inizia a 1.2 deviazioni standard
-        //    (circa l'88° percentile), garantendo reattività alle espressioni genuine.
-        const actCorr = zCorrugator > 1.2 ? zCorrugator * poseConfidence : 0;
-        const actEar = zEar > 1.2 ? zEar : 0;
-        const actLip = (zLip > 1.8 && !isSpeaking) ? zLip : 0; 
+        // Clamping zEar: evita che valori estremi dominino
+        const zEarClamped = Math.min(Math.abs(zEar), 3.0) * Math.sign(zEar);
 
-        let stressDelta = (actCorr * 2.0) + (actEar * 0.8) + (actLip * 0.5);
-        const isConfused = (zCorrugator > 1.0) && (zAsymmetry > 2.0);
+        // Corrugatore: soglia 1.0 (era 1.2) — più reattivo alle sopracciglia aggrottate
+        const actCorr = zCorrugator > 1.0 ? zCorrugator * poseConfidence : 0;
+
+        // EAR: soglia 1.5 (era 1.8) — più reattivo allo strizzare gli occhi
+        const actEar = zEarClamped > 1.5 ? zEarClamped : 0;
+
+        // Lip/sbuffo: soglia abbassata 1.8→1.3 e NON bloccato da isSpeaking
+        // perché lo sbuffo è un movimento labiale breve e deciso
+        const actLip = zLip > 1.3 ? zLip : 0;
+
+        // Pesi: corrugatore dominante, EAR moderato, labbra per sbuffo
+        let stressDelta = (actCorr * 2.0) + (actEar * 0.5) + (actLip * 0.8);
+
+        // Confusione: corrugatore > 1.0 + asimmetria > 1.8 (era 2.0)
+        const isConfused = (zCorrugator > 1.0) && (zAsymmetry > 1.8);
 
         let boredomDelta = 0;
         if (isFaceStatic && zEar > 1.2 && zCorrugator < 0.5) {
@@ -121,8 +133,6 @@ export class AffectAnalyzer {
             this.boredomAccumulator *= 0.5;
         }
 
-        // Rolling baseline rallentata: evita che il sistema si "abitui" troppo in fretta
-        // a una espressione prolungata di concentrazione.
         if (this.stressAccumulator < 20 && boredomDelta === 0 && !isSpeaking && !isConfused) {
             const alpha = 0.1 * dtSec;
             this.baseline.corrugator.mean = (1 - alpha) * this.baseline.corrugator.mean + alpha * metrics.corrugator;
@@ -130,11 +140,9 @@ export class AffectAnalyzer {
             this.baseline.lipPress.mean = (1 - alpha) * this.baseline.lipPress.mean + alpha * metrics.lipPress;
         }
 
-        // 3. Ribilanciamento Derivate Temporali: 
-        //    L'incremento è stato innalzato e il decadimento è stato più che dimezzato.
-        //    Ora lo stress si accumula più fluidamente e richiede tempo per svanire.
-        const incrementoStress = stressDelta * 20.0 * dtSec;
-        const decadimentoStress = 25.0 * dtSec;
+        // Incremento 16→18, decadimento rimane 30
+        const incrementoStress = stressDelta * 18.0 * dtSec;
+        const decadimentoStress = 30.0 * dtSec;
         this.stressAccumulator += (incrementoStress - decadimentoStress);
         this.stressAccumulator = Math.max(0, Math.min(this.stressAccumulator, this.activationThreshold));
 
@@ -142,11 +150,10 @@ export class AffectAnalyzer {
         this.boredomAccumulator += (boredomDelta - decadimentoNoia);
         this.boredomAccumulator = Math.max(0, Math.min(this.boredomAccumulator, this.activationThreshold));
 
-        // 4. Isteresi ristretta: Si innesca a 80 e si disinnesca solo scendendo sotto 40,
-        //    simulando il tempo di recupero fisiologico umano.
+        // Isteresi: scatta a 80, si spegne sotto 35
         if (this.stressAccumulator >= 80) {
             this.currentStateFrustrated = true;
-        } else if (this.stressAccumulator < 40) {
+        } else if (this.stressAccumulator < 35) {
             this.currentStateFrustrated = false;
         }
 

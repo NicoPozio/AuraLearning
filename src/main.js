@@ -5,7 +5,7 @@ import { AffectAnalyzer } from "./analysis/AffectAnalyzer.js";
 import { GazeCalibrator } from "./calibration/GazeCalibrator.js";
 import { CalibrationUI } from "./calibration/CalibrationUI.js";
 import { OneEuroFilter } from "./utils/OneEuroFilter.js";
-import { VoiceInput } from "./sensors/VoiceInput.js"; // <-- NUOVO IMPORT
+import { VoiceInput } from "./sensors/VoiceInput.js";
 import { ECAController } from "./eca/ECAController.js";
 
 let video, canvas, ctx, gazeDot;
@@ -13,13 +13,28 @@ let btnCalGaze, btnCalEmotion, calOverlay;
 
 let sessionData = [];
 let currentSmoothPos = { x: 0, y: 0 };
-let currentFinalTranscript = ""; // <-- Variabile per salvare l'ultima frase nel CSV
+let currentFinalTranscript = "";
 
 let faceLandmarker;
 let lastVideoTime = -1;
 let lastFrameTimeMs = performance.now();
 let isGazeCalibrating = false;
 let currentNormalizedIris = null;
+
+// --- VARIABILI FASE PROATTIVA E CONVERSAZIONALE ---
+let lastProactiveIntervention = 0;
+const PROACTIVE_COOLDOWN_MS = 30000;
+let isProactiveInterventionActive = false;
+let primoInterventoFatto = false;
+
+let isAnsweringUser = false;
+
+// 🛡️ Filtri e Smoothing per Microfono ed Eco
+let ignoreMicUntil = 0;
+let userMicTimeout = null;
+// --------------------------------------------------
+
+let lastLogTs = 0;
 
 const affectAnalyzer = new AffectAnalyzer();
 const eca = new ECAController('eca-container');
@@ -28,12 +43,25 @@ const uiFilter = new OneEuroFilter(60, 0.1, 0.001, 1.0);
 const gazeEstimator = new GazeEstimator();
 
 let calibrationUI;
-let voiceInput; // <-- Istanza globale
+let voiceInput;
 
 const lumaCanvas = document.createElement('canvas');
 lumaCanvas.width = 32;
 lumaCanvas.height = 32;
 const lumaCtx = lumaCanvas.getContext('2d', { willReadFrequently: true });
+
+// ─── 🛡️ FUNZIONE WRAPPER ANTI-ECO ───
+async function parlaECA(frase) {
+    ignoreMicUntil = Infinity;
+    try {
+        await eca.speak(frase);
+    } catch (e) {
+        console.error("Errore TTS:", e);
+    } finally {
+        ignoreMicUntil = performance.now() + 1500;
+    }
+}
+// ────────────────────────────────────
 
 async function init() {
     const vision = await FilesetResolver.forVisionTasks(
@@ -55,35 +83,88 @@ async function init() {
         gazeDot.style.display = 'block';
     });
 
-    // ─── INIZIALIZZAZIONE MODULO VOCALE ───
+    // ─── GESTIONE DEL MICROFONO UTENTE E ANIMAZIONE ASCOLTO ───
     voiceInput = new VoiceInput((interim, final) => {
+
+        if (performance.now() < ignoreMicUntil || isAnsweringUser || isProactiveInterventionActive) {
+            return;
+        }
+
         const voiceDiv = document.getElementById('val-voice');
+
+        // Se sento rumore e l'ECA è in IDLE, mettilo in LISTENING!
+        if ((interim || final) && eca.currentState === 'IDLE') {
+            eca.setState('LISTENING');
+        }
+
+        // Pulisco eventuali timeout di ritorno a IDLE vecchi
+        if (userMicTimeout) clearTimeout(userMicTimeout);
+
         if (final) {
             currentFinalTranscript = final.trim();
             voiceDiv.innerHTML = `<span style="color: #0f172a; font-weight: 600;">${final}</span>`;
-            // Resetta la frase dopo 3 secondi nel CSV per non duplicarla all'infinito
+            console.log(`[UTENTE]: "${currentFinalTranscript}"`);
+
+            if (currentFinalTranscript.length > 5) {
+                // L'utente ha fatto una domanda vera: partiamo con il flusso!
+                gestisciDomandaUtente(currentFinalTranscript);
+            } else {
+                // Falso allarme (es. un colpo di tosse o parola breve), torna in IDLE
+                eca.setState('IDLE');
+            }
+
             setTimeout(() => { if (currentFinalTranscript === final.trim()) currentFinalTranscript = ""; }, 3000);
+
         } else if (interim) {
             voiceDiv.innerHTML = `<span style="font-style: italic;">${interim}...</span>`;
+
+            // Imposta un timer di sicurezza: se entro 1.5s non arriva una parola nuova o una conferma (final), 
+            // significa che l'utente ha smesso di parlare senza generare una frase valida. Torna in IDLE.
+            userMicTimeout = setTimeout(() => {
+                if (eca.currentState === 'LISTENING') {
+                    eca.setState('IDLE');
+                }
+            }, 1500);
         }
     }, (statusMessage) => {
         document.getElementById('voice-status').innerText = statusMessage;
     });
 
-    // Avvia l'ascolto appena la webcam è pronta
     voiceInput.start();
 
-    // ─── CARICAMENTO MODELLO 3D (ECA) ───
     try {
-        await eca.loadModel('./models/avatar.glb');
-        console.log("Modello 3D caricato con successo!");
+        await eca.loadModel('./models/personaggio.fbx');
+        console.log("✅ Modello 3D caricato con successo!");
     } catch (error) {
-        console.error("Errore durante il caricamento del modello 3D:", error);
+        console.error("❌ Errore caricamento modello 3D:", error);
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: true }); // Aggiunto audio: true
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
     video.srcObject = stream;
     video.addEventListener('loadeddata', loop);
+}
+
+// ─── FLUSSO CONVERSAZIONALE LLM ───
+async function gestisciDomandaUtente(domandaText) {
+    if (isAnsweringUser || isProactiveInterventionActive) return;
+
+    isAnsweringUser = true;
+
+    // Risponde per dire "Ho capito"
+    await parlaECA("Certo, dammi un secondo che elaboro le informazioni.");
+
+    // ORA entra in THINKING mentre simula la ricerca su LLM
+    console.log("🧠 [AURA] Sto pensando alla risposta...");
+    eca.setState('THINKING');
+
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    console.log("💡 [AURA] Risposta trovata!");
+    await parlaECA(`Eccomi. Riguardo a quello che mi hai chiesto... facciamo finta che ti stia spiegando perfettamente l'argomento! Sono sempre a disposizione.`);
+
+    lastProactiveIntervention = performance.now();
+    isAnsweringUser = false;
+    eca.setState('IDLE');
 }
 
 function drawFaceMeshSegments(landmarks) {
@@ -120,9 +201,7 @@ async function loop() {
 
         const dtSecClamped = Math.min(dtSec, 0.1);
 
-        // --- CHIAMATA DI AGGIORNAMENTO ECA ---
         eca.update(dtSecClamped);
-        // -------------------------------------
 
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -138,25 +217,6 @@ async function loop() {
                 requestAnimationFrame(loop);
                 return;
             }
-
-            const dx = landmarks[263].x - landmarks[33].x;
-            const dy = landmarks[263].y - landmarks[33].y;
-            const dzYaw = landmarks[263].z - landmarks[33].z;
-
-            const roll = Math.atan2(dy, dx) * (180 / Math.PI);
-            const yaw = Math.atan2(dzYaw, dx) * (180 / Math.PI);
-
-            const dyPitch = landmarks[152].y - landmarks[10].y;
-            const dzPitch = landmarks[152].z - landmarks[10].z;
-            const pitch = Math.atan2(dzPitch, dyPitch) * (180 / Math.PI);
-
-            lumaCtx.drawImage(video, 0, 0, 32, 32);
-            const lumaData = lumaCtx.getImageData(0, 0, 32, 32).data;
-            let lumaSum = 0;
-            for (let i = 0; i < lumaData.length; i += 4) {
-                lumaSum += (lumaData[i] * 0.299 + lumaData[i + 1] * 0.587 + lumaData[i + 2] * 0.114);
-            }
-            const averageLuma = lumaSum / 1024;
 
             currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
 
@@ -180,9 +240,24 @@ async function loop() {
                 if (done) {
                     calOverlay.style.display = 'none';
                     document.getElementById('val-status').innerText = "Calibrazione completata. Rilevamento attivo.";
+                    console.log("✅ Calibrazione emotiva completata!");
+
+                    setTimeout(async () => {
+                        isProactiveInterventionActive = true;
+                        try {
+                            await parlaECA("Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.");
+                        } finally {
+                            isProactiveInterventionActive = false;
+                            console.log("✅ [AURA] Presentazione conclusa, in ascolto.");
+                        }
+                    }, 1000);
                 }
             } else if (affectAnalyzer.isCalibrated) {
                 const state = affectAnalyzer.update(rawMetrics, dtSecClamped);
+
+                if (ts - lastLogTs > 1000) {
+                    lastLogTs = ts;
+                }
 
                 document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                 document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
@@ -191,20 +266,47 @@ async function loop() {
                 const cardStatus = document.getElementById('card-status');
                 cardStatus.classList.remove('alert', 'warning', 'info');
 
-                if (state.isSpeaking) {
-                    cardStatus.classList.add('info');
-                    document.getElementById('val-status').innerText = "VAD: Movimento Labiale...";
-                } else if (state.isFrustrated) {
-                    cardStatus.classList.add('alert');
-                    document.getElementById('val-status').innerText = `SOVRACCARICO (${state.stressPercentage.toFixed(0)}%)`;
-                } else if (state.isConfused) {
-                    cardStatus.classList.add('warning');
-                    document.getElementById('val-status').innerText = `CONFUSIONE RILEVATA`;
-                } else if (state.isBored) {
-                    cardStatus.classList.add('info');
-                    document.getElementById('val-status').innerText = `NOIA (${state.boredomPercentage.toFixed(0)}%)`;
-                } else {
-                    document.getElementById('val-status').innerText = `Attivo e Regolare (${state.stressPercentage.toFixed(0)}%)`;
+                if (!isProactiveInterventionActive && !isAnsweringUser) {
+                    if (state.isSpeaking) {
+                        cardStatus.classList.add('info');
+                        document.getElementById('val-status').innerText = "VAD: Movimento Labiale...";
+                    } else if (state.isFrustrated) {
+                        cardStatus.classList.add('alert');
+                        document.getElementById('val-status').innerText = `SOVRACCARICO (${state.stressPercentage.toFixed(0)}%)`;
+                    } else if (state.isConfused) {
+                        cardStatus.classList.add('warning');
+                        document.getElementById('val-status').innerText = `CONFUSIONE RILEVATA`;
+                    } else if (state.isBored) {
+                        cardStatus.classList.add('info');
+                        document.getElementById('val-status').innerText = `NOIA (${state.boredomPercentage.toFixed(0)}%)`;
+                    } else {
+                        document.getElementById('val-status').innerText = `Attivo e Regolare (${state.stressPercentage.toFixed(0)}%)`;
+                    }
+                }
+
+                // RIMOSSO IL BLOCCO DI CODICE CHE CAUSAVA IL CONFLITTO SULLO STATO LISTENING
+                // Adesso è solo il microfono (in cima al file) a decidere quando l'ECA va in LISTENING.
+
+                // ─── INTERVENTO PROATTIVO ───
+                const timeSinceLastIntervention = ts - lastProactiveIntervention;
+                const cooldownPassato = timeSinceLastIntervention > PROACTIVE_COOLDOWN_MS;
+                const puoIntervenireTempo = !primoInterventoFatto || cooldownPassato;
+
+                if ((state.isFrustrated || state.isConfused) && puoIntervenireTempo && !isProactiveInterventionActive && !isAnsweringUser) {
+                    console.log(`🤖 [AURA] Intervento INNESCATO!`);
+
+                    isProactiveInterventionActive = true;
+                    primoInterventoFatto = true;
+                    lastProactiveIntervention = ts;
+
+                    const fraseIntervento = state.isConfused
+                        ? "Vedo che sei un po' confuso. C'è qualche concetto di questo argomento che vorresti che ti rispiegassi?"
+                        : "Sembri frustrato. Vuoi che facciamo una piccola pausa o preferisci affrontare questo passaggio insieme?";
+
+                    parlaECA(fraseIntervento).then(() => {
+                        console.log("⏳ [AURA] Intervento concluso.");
+                        isProactiveInterventionActive = false;
+                    });
                 }
 
                 if (gazeCalibrator.regressionModel) {
@@ -221,7 +323,7 @@ async function loop() {
                         isBored: state.isBored ? 1 : 0,
                         isConfused: state.isConfused ? 1 : 0,
                         isSpeaking: state.isSpeaking ? 1 : 0,
-                        spokenText: currentFinalTranscript // <-- NUOVO: Esportazione della frase pronunciata
+                        spokenText: currentFinalTranscript
                     });
                 }
             }
@@ -250,9 +352,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
     btnCalEmotion.onclick = () => {
         btnCalEmotion.blur();
+
+        eca.currentAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+        eca.currentAudio.play().catch(() => { });
+
         calOverlay.style.display = 'block';
         document.getElementById('val-status').innerText = "Acquisizione Baseline...";
         affectAnalyzer.startCalibration();
+        console.log("🎯 Calibrazione emotiva avviata...");
     };
 
     const btnExport = document.getElementById('btn-export');
@@ -260,12 +367,11 @@ document.addEventListener("DOMContentLoaded", () => {
         btnExport.onclick = () => {
             btnExport.blur();
             if (sessionData.length === 0) {
-                alert("Nessun dato registrato. Esegui prima le calibrazioni.");
+                alert("Nessun dato registrato.");
                 return;
             }
             const headers = Object.keys(sessionData[0]).join(",");
             const rows = sessionData.map(row => {
-                // Sostituisce le virgole nelle frasi parlate con un punto e virgola per non rompere il CSV
                 if (row.spokenText) row.spokenText = row.spokenText.replace(/,/g, ';');
                 return Object.values(row).join(",");
             }).join("\n");
@@ -280,31 +386,6 @@ document.addEventListener("DOMContentLoaded", () => {
             document.body.removeChild(link);
         };
     }
-
-    window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space' && isGazeCalibrating) {
-            e.preventDefault();
-            if (!e.repeat && currentNormalizedIris) {
-                const target = calibrationUI.getNextPointCoords();
-                gazeCalibrator.recordDataPoint(currentNormalizedIris.x, currentNormalizedIris.y, target.x, target.y);
-                calibrationUI.advance();
-            }
-        }
-
-        // --- TASTI DI DEBUG PER GLI STATI DELL'ECA ---
-        if (e.code === 'KeyT') {
-            eca.speak("Ciao! Sono il tuo assistente Aura. Sto testando il movimento della mia bocca.");
-        }
-        if (e.code === 'KeyI') {
-            eca.setState('IDLE');
-        }
-        if (e.code === 'KeyL') {
-            eca.setState('LISTENING');
-        }
-        if (e.code === 'KeyP') {
-            eca.setState('THINKING');
-        }
-    });
 
     init();
 });
