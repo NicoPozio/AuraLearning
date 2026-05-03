@@ -21,6 +21,9 @@ let lastFrameTimeMs = performance.now();
 let isGazeCalibrating = false;
 let currentNormalizedIris = null;
 
+// 🟢 NUOVO: Blocca il microfono e l'IA finché il PDF non è pronto
+let isPdfLoaded = false;
+
 // --- VARIABILI FASE PROATTIVA E CONVERSAZIONALE ---
 let lastProactiveIntervention = 0;
 const PROACTIVE_COOLDOWN_MS = 30000;
@@ -36,6 +39,10 @@ let userMicTimeout = null;
 
 let lastLogTs = 0;
 
+const GEMINI_API_KEY = "AIzaSyDl-6nqknNCjx1dxX9FRFRgH-jGHKgatTg";
+let chatHistory = [];
+let currentEmotionState = "Neutrale";
+
 const affectAnalyzer = new AffectAnalyzer();
 const eca = new ECAController('eca-container');
 const gazeCalibrator = new GazeCalibrator();
@@ -50,7 +57,20 @@ lumaCanvas.width = 32;
 lumaCanvas.height = 32;
 const lumaCtx = lumaCanvas.getContext('2d', { willReadFrequently: true });
 
-// ─── 🛡️ FUNZIONE WRAPPER ANTI-ECO ───
+// ─── Aggiunge un messaggio alla chat ───
+function addChatMessage(sender, text) {
+    const chatBox = document.getElementById('chat-box');
+    if (!chatBox) return;
+    const msgDiv = document.createElement('div');
+    msgDiv.classList.add('chat-message');
+    msgDiv.classList.add(sender === 'user' ? 'msg-user' : 'msg-ai');
+    msgDiv.innerText = text;
+    chatBox.appendChild(msgDiv);
+    chatBox.scrollTop = chatBox.scrollHeight;
+    chatHistory.push({ role: sender === 'user' ? 'user' : 'model', parts: [{ text: text }] });
+}
+
+// ─── Wrapper anti-eco: blocca il microfono mentre l'ECA parla ───
 async function parlaECA(frase) {
     ignoreMicUntil = Infinity;
     try {
@@ -86,7 +106,8 @@ async function init() {
     // ─── GESTIONE DEL MICROFONO UTENTE E ANIMAZIONE ASCOLTO ───
     voiceInput = new VoiceInput((interim, final) => {
 
-        if (performance.now() < ignoreMicUntil || isAnsweringUser || isProactiveInterventionActive) {
+        // 🟢 Se il PDF non è caricato, AURA IGNORA TUTTO QUELLO CHE DICI
+        if (!isPdfLoaded || performance.now() < ignoreMicUntil || isAnsweringUser || isProactiveInterventionActive) {
             return;
         }
 
@@ -105,7 +126,10 @@ async function init() {
             voiceDiv.innerHTML = `<span style="color: #0f172a; font-weight: 600;">${final}</span>`;
             console.log(`[UTENTE]: "${currentFinalTranscript}"`);
 
-            if (currentFinalTranscript.length > 5) {
+            const textLower = currentFinalTranscript.toLowerCase();
+            const isWakeWordSpoken = textLower.startsWith("aura") || textLower.includes("aura");
+
+            if (currentFinalTranscript.length > 5 && isWakeWordSpoken) {
                 // L'utente ha fatto una domanda vera: partiamo con il flusso!
                 gestisciDomandaUtente(currentFinalTranscript);
             } else {
@@ -130,6 +154,7 @@ async function init() {
         document.getElementById('voice-status').innerText = statusMessage;
     });
 
+    // Avvio microfono qui per avere i permessi, ma bloccato dalla logica sopra!
     voiceInput.start();
 
     try {
@@ -144,23 +169,53 @@ async function init() {
     video.addEventListener('loadeddata', loop);
 }
 
+// ─── Chiamata a Gemini ───
+async function fetchGeminiResponse(userText) {
+    if (!GEMINI_API_KEY) return "Errore API KEY.";
+
+    const systemPrompt = `Sei Aura, un tutor didattico virtuale.
+L'utente sembra: ${currentEmotionState}.
+REGOLE: 1. NON presentarti mai. 2. Vai dritto al sodo. 3. Sii concisa (max 3 frasi). 4. Solo testo semplice.ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare LaTeX, vietati gli asterischi (*), vietato il simbolo del dollaro ($). Scrivi le formule matematiche a parole in italiano (es. "a al quadrato più b al quadrato uguale c al quadrato").`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+    const contents = [
+        { role: "user", parts: [{ text: systemPrompt }] },
+        { role: "model", parts: [{ text: "Ricevuto." }] },
+        ...chatHistory.slice(-10),
+        { role: "user", parts: [{ text: userText }] }
+    ];
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contents: contents })
+        });
+        const data = await response.json();
+        return data.candidates[0].content.parts[0].text;
+    } catch (e) {
+        return "Errore di connessione.";
+    }
+}
+
 // ─── FLUSSO CONVERSAZIONALE LLM ───
 async function gestisciDomandaUtente(domandaText) {
     if (isAnsweringUser || isProactiveInterventionActive) return;
 
     isAnsweringUser = true;
 
+    addChatMessage('user', domandaText);
     // Risponde per dire "Ho capito"
-    await parlaECA("Certo, dammi un secondo che elaboro le informazioni.");
+    await parlaECA("Certo, dammi un secondo.");
 
     // ORA entra in THINKING mentre simula la ricerca su LLM
     console.log("🧠 [AURA] Sto pensando alla risposta...");
     eca.setState('THINKING');
 
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    console.log("💡 [AURA] Risposta trovata!");
-    await parlaECA(`Eccomi. Riguardo a quello che mi hai chiesto... facciamo finta che ti stia spiegando perfettamente l'argomento! Sono sempre a disposizione.`);
+    const aiResponseTesto = await fetchGeminiResponse(domandaText);
+    addChatMessage('ai', aiResponseTesto);
+    await parlaECA(aiResponseTesto);
 
     lastProactiveIntervention = performance.now();
     isAnsweringUser = false;
@@ -226,13 +281,16 @@ async function loop() {
                 const depthCorrectedY = currentNormalizedIris.y * depthScale;
 
                 const rawPos = gazeCalibrator.predict(depthCorrectedX, depthCorrectedY);
-                const smoothPos = uiFilter.filter(rawPos.x, rawPos.y, ts);
 
-                currentSmoothPos = smoothPos;
+                // 🟢 FIX CRASH: Se rawPos è valido, muovi il pallino
+                if (rawPos) {
+                    const smoothPos = uiFilter.filter(rawPos.x, rawPos.y, ts);
+                    currentSmoothPos = smoothPos;
 
-                gazeDot.style.left = `${smoothPos.x}px`;
-                gazeDot.style.top = `${smoothPos.y}px`;
-                document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
+                    gazeDot.style.left = `${smoothPos.x}px`;
+                    gazeDot.style.top = `${smoothPos.y}px`;
+                    document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
+                }
             }
 
             if (affectAnalyzer.isCalibrating) {
@@ -245,7 +303,9 @@ async function loop() {
                     setTimeout(async () => {
                         isProactiveInterventionActive = true;
                         try {
-                            await parlaECA("Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.");
+                            const saluto = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
+                            addChatMessage('ai', saluto);
+                            await parlaECA(saluto);
                         } finally {
                             isProactiveInterventionActive = false;
                             console.log("✅ [AURA] Presentazione conclusa, in ascolto.");
@@ -259,9 +319,16 @@ async function loop() {
                     lastLogTs = ts;
                 }
 
+                // Aggiorna stato emotivo per Gemini
+                if (state.isFrustrated) currentEmotionState = "Molto Frustrato";
+                else if (state.isConfused) currentEmotionState = "Confuso";
+                else currentEmotionState = "Attento";
+
                 document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                 document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
-                document.getElementById('val-asym').innerText = `${rawMetrics.browAsymmetry.toFixed(3)}`;
+
+                const asymEl = document.getElementById('val-asym');
+                if (asymEl) asymEl.innerText = `${rawMetrics.browAsymmetry.toFixed(3)}`;
 
                 const cardStatus = document.getElementById('card-status');
                 cardStatus.classList.remove('alert', 'warning', 'info');
@@ -284,15 +351,13 @@ async function loop() {
                     }
                 }
 
-                // RIMOSSO IL BLOCCO DI CODICE CHE CAUSAVA IL CONFLITTO SULLO STATO LISTENING
-                // Adesso è solo il microfono (in cima al file) a decidere quando l'ECA va in LISTENING.
-
                 // ─── INTERVENTO PROATTIVO ───
                 const timeSinceLastIntervention = ts - lastProactiveIntervention;
                 const cooldownPassato = timeSinceLastIntervention > PROACTIVE_COOLDOWN_MS;
                 const puoIntervenireTempo = !primoInterventoFatto || cooldownPassato;
 
-                if ((state.isFrustrated || state.isConfused) && puoIntervenireTempo && !isProactiveInterventionActive && !isAnsweringUser) {
+                // 🟢 AURA INTERVIENE SOLO SE LE SLIDE SONO CARICATE (isPdfLoaded)
+                if (isPdfLoaded && (state.isFrustrated || state.isConfused) && puoIntervenireTempo && !isProactiveInterventionActive && !isAnsweringUser) {
                     console.log(`🤖 [AURA] Intervento INNESCATO!`);
 
                     isProactiveInterventionActive = true;
@@ -303,6 +368,7 @@ async function loop() {
                         ? "Vedo che sei un po' confuso. C'è qualche concetto di questo argomento che vorresti che ti rispiegassi?"
                         : "Sembri frustrato. Vuoi che facciamo una piccola pausa o preferisci affrontare questo passaggio insieme?";
 
+                    addChatMessage('ai', fraseIntervento);
                     parlaECA(fraseIntervento).then(() => {
                         console.log("⏳ [AURA] Intervento concluso.");
                         isProactiveInterventionActive = false;
@@ -362,6 +428,21 @@ document.addEventListener("DOMContentLoaded", () => {
         console.log("🎯 Calibrazione emotiva avviata...");
     };
 
+    // ── TASTO SPAZIO: registra punto di calibrazione sguardo ──
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space' && isGazeCalibrating) {
+            e.preventDefault();
+            if (!e.repeat && currentNormalizedIris) {
+                const target = calibrationUI.getNextPointCoords();
+                gazeCalibrator.recordDataPoint(
+                    currentNormalizedIris.x, currentNormalizedIris.y,
+                    target.x, target.y
+                );
+                calibrationUI.advance();
+            }
+        }
+    });
+
     const btnExport = document.getElementById('btn-export');
     if (btnExport) {
         btnExport.onclick = () => {
@@ -385,6 +466,104 @@ document.addEventListener("DOMContentLoaded", () => {
             link.click();
             document.body.removeChild(link);
         };
+    }
+
+    // ── Bottoni vista PDF / Webcam ──
+    const btnShowPdf = document.getElementById('btn-show-pdf');
+    const btnShowCam = document.getElementById('btn-show-cam');
+
+    if (btnShowPdf) {
+        btnShowPdf.onclick = () => {
+            document.getElementById('video-wrapper').style.display = 'none';
+            document.getElementById('pdf-wrapper').style.display = 'block';
+            btnShowPdf.style.display = 'none';
+            btnShowCam.style.display = 'inline-block';
+            document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'none');
+            const chatContainer = document.getElementById('chat-container');
+            if (chatContainer) chatContainer.style.display = 'flex';
+        };
+    }
+
+    if (btnShowCam) {
+        btnShowCam.onclick = () => {
+            document.getElementById('pdf-wrapper').style.display = 'none';
+            document.getElementById('video-wrapper').style.display = 'block';
+            btnShowCam.style.display = 'none';
+            btnShowPdf.style.display = 'inline-block';
+            document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'block');
+            const chatContainer = document.getElementById('chat-container');
+            if (chatContainer) chatContainer.style.display = 'none';
+        };
+    }
+
+    // ── Gestione PDF ──
+    const dropZone = document.getElementById('pdf-drop-zone');
+    const inputPdf = document.getElementById('input-pdf');
+    const slidesContainer = document.getElementById('slides-container');
+    const pdfSpinner = document.getElementById('pdf-loading-spinner');
+
+    if (dropZone && inputPdf && slidesContainer) {
+        dropZone.onclick = () => inputPdf.click();
+        dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('dragover'); };
+        dropZone.ondrop = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
+        inputPdf.onchange = (e) => handlePdfUpload(e.target.files[0]);
+    }
+
+    function handlePdfUpload(file) {
+        if (!file || file.type !== "application/pdf") return alert("Carica un PDF.");
+
+        const pdfjsLib = window['pdfjs-dist/build/pdf'];
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        // Mostra spinner PDF e nascondi drop zone
+        if (dropZone) dropZone.style.display = 'none';
+        if (slidesContainer) slidesContainer.style.display = 'none';
+        if (pdfSpinner) pdfSpinner.style.display = 'block';
+
+        // Voce in parallelo — non aspettiamo che finisca
+        const auraPromise = parlaECA("Sto caricando le slide e ci vorrà poco tempo.");
+
+        const fileReader = new FileReader();
+        fileReader.onload = async function () {
+            try {
+                const pdf = await pdfjsLib.getDocument(new Uint8Array(this.result)).promise;
+                slidesContainer.innerHTML = '';
+                slidesContainer.style.display = 'block';
+
+                for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                    const page = await pdf.getPage(pageNum);
+                    const viewport = page.getViewport({ scale: 1.5 });
+                    const slideCanvas = document.createElement('canvas');
+                    slideCanvas.id = "slide_" + pageNum;
+                    slideCanvas.className = 'pdf-slide';
+                    slideCanvas.height = viewport.height;
+                    slideCanvas.width = viewport.width;
+                    slidesContainer.appendChild(slideCanvas);
+                    await page.render({ canvasContext: slideCanvas.getContext('2d'), viewport: viewport }).promise;
+                }
+
+                // Aspetta che l'avatar finisca di dire la prima frase, se non l'ha già fatto
+                await auraPromise;
+
+                // ── Spinner si nasconde SOLO dopo tutte le slide nel DOM ──
+                if (pdfSpinner) pdfSpinner.style.display = 'none';
+
+                const msg = `Caricamento completato. Ci sono ${pdf.numPages} pagine. Chiamami dicendo "Aura" per farmi una domanda.`;
+                addChatMessage('ai', msg);
+                await parlaECA(msg);
+
+                // 🟢 SBLOCCA IL MICROFONO E GLI INTERVENTI PROATTIVI
+                isPdfLoaded = true;
+                lastProactiveIntervention = performance.now(); // Resetta il cooldown per evitare spam immediato
+                console.log("✅ PDF caricato. Aura è in ascolto e pronta a intervenire.");
+
+            } catch (error) {
+                console.error(error);
+                if (pdfSpinner) pdfSpinner.style.display = 'none';
+                alert("Errore durante il caricamento del PDF.");
+            }
+        };
+        fileReader.readAsArrayBuffer(file);
     }
 
     init();

@@ -5,9 +5,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Aura MVP - Controller Sensoriale Avanzato</title>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
     <style>
         :root {
             --primary: #2b5797;
+            --secondary: #8b5cf6;
             --error: #b91d47;
             --warning: #f59e0b;
             --info: #3b82f6;
@@ -26,7 +30,7 @@
         .dashboard-layout {
             display: flex;
             gap: 24px;
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
             align-items: flex-start;
         }
@@ -44,10 +48,12 @@
             display: flex;
             flex-direction: column;
             gap: 16px;
+            min-width: 350px;
         }
 
         .header-controls {
             display: flex;
+            flex-wrap: wrap;
             gap: 10px;
             margin-bottom: 20px;
         }
@@ -60,19 +66,25 @@
             border-radius: 4px;
             font-weight: 600;
             cursor: pointer;
+            transition: opacity 0.2s;
         }
 
-        button:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
+        button:hover {
+            opacity: 0.9;
+        }
+
+        .workspace-container {
+            position: relative;
+            width: 100%;
+            background: #e2e8f0;
+            border-radius: 6px;
+            overflow: hidden;
         }
 
         .video-container {
-            position: relative;
             width: 100%;
-            border-radius: 6px;
-            overflow: hidden;
             background: #000;
+            position: relative;
             aspect-ratio: 4/3;
         }
 
@@ -83,7 +95,7 @@
             transform: scaleX(-1);
         }
 
-        canvas {
+        canvas#output-canvas {
             position: absolute;
             top: 0;
             left: 0;
@@ -91,6 +103,67 @@
             height: 100%;
             transform: scaleX(-1);
             pointer-events: none;
+        }
+
+        #pdf-wrapper {
+            display: none;
+            width: 100%;
+            height: 70vh;
+            overflow-y: auto;
+            background: #f8fafc;
+            padding: 20px;
+            box-sizing: border-box;
+            position: relative;
+            /* ← necessario per lo spinner PDF assoluto */
+        }
+
+        #pdf-drop-zone {
+            border: 3px dashed #cbd5e1;
+            border-radius: 12px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            background: #ffffff;
+            transition: all 0.3s;
+            margin-top: 50px;
+        }
+
+        #pdf-drop-zone:hover,
+        #pdf-drop-zone.dragover {
+            border-color: var(--secondary);
+            background: #f1f5f9;
+        }
+
+        /* Spinner PDF — centrato dentro pdf-wrapper, sopra le slide */
+        #pdf-loading-spinner {
+            display: none;
+            position: sticky;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 20;
+            background: rgba(255, 255, 255, 0.85);
+            border-radius: 12px;
+            padding: 24px 32px;
+            text-align: center;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+            width: fit-content;
+            margin: 0 auto;
+        }
+
+        #pdf-loading-spinner p {
+            margin: 12px 0 0 0;
+            color: var(--primary);
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .pdf-slide {
+            display: block;
+            margin: 0 auto 30px auto;
+            max-width: 100%;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e2e8f0;
         }
 
         .data-card {
@@ -132,6 +205,28 @@
             font-weight: 600;
         }
 
+        .chat-message {
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-family: sans-serif;
+            line-height: 1.4;
+        }
+
+        .msg-user {
+            background: #e2e8f0;
+            color: #1e293b;
+            align-self: flex-end;
+            border-bottom-right-radius: 0;
+        }
+
+        .msg-ai {
+            background: var(--primary);
+            color: white;
+            align-self: flex-start;
+            border-bottom-left-radius: 0;
+        }
+
         #gaze-dot {
             position: fixed;
             width: 12px;
@@ -158,6 +253,7 @@
             z-index: 10;
         }
 
+        /* Spinner ECA (nella sidebar) */
         .spinner {
             width: 32px;
             height: 32px;
@@ -165,6 +261,17 @@
             border-radius: 50%;
             border-top-color: var(--primary);
             animation: spin 1s linear infinite;
+        }
+
+        /* Spinner PDF (più grande) */
+        .spinner-lg {
+            width: 48px;
+            height: 48px;
+            border: 5px solid rgba(139, 92, 246, 0.2);
+            border-radius: 50%;
+            border-top-color: var(--secondary);
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
         }
 
         @keyframes spin {
@@ -182,40 +289,73 @@
         <div class="main-panel">
             <div class="header-controls">
                 <button id="btn-cal-gaze">1. Calibrazione Sguardo</button>
-                <button id="btn-cal-emotion">2. Calibrazione Emotiva (Viso Neutro)</button>
-                <button id="btn-export" style="background: #10b981;">3. Scarica Dati Test (CSV)</button>
+                <button id="btn-cal-emotion">2. Calibrazione Emotiva</button>
+                <button id="btn-export" style="background: #10b981;">3. Dati (CSV)</button>
+                <button id="btn-show-pdf" style="background: var(--secondary);">4. Area Studio (PDF)</button>
+                <button id="btn-show-cam" style="background: #64748b; display: none;">Torna alla Webcam</button>
+                <input type="file" id="input-pdf" accept="application/pdf" style="display: none;" />
             </div>
 
-            <div class="video-container">
-                <video id="webcam" autoplay playsinline></video>
-                <canvas id="output-canvas"></canvas>
-                <div id="cal-overlay" class="calibration-overlay">
-                    Acquisizione Baseline... Mantenere espressione neutra.
+            <div class="workspace-container">
+                <div id="video-wrapper" class="video-container">
+                    <video id="webcam" autoplay playsinline></video>
+                    <canvas id="output-canvas"></canvas>
+                    <div id="cal-overlay" class="calibration-overlay">
+                        Acquisizione Baseline... Mantenere espressione neutra.
+                    </div>
+                </div>
+
+                <div id="pdf-wrapper">
+                    <!-- SPINNER PDF: visibile durante il caricamento delle slide -->
+                    <div id="pdf-loading-spinner">
+                        <div class="spinner-lg"></div>
+                        <p>Caricamento slide in corso...</p>
+                    </div>
+
+                    <div id="pdf-drop-zone">
+                        <svg width="64" height="64" fill="#94a3b8" viewBox="0 0 24 24" style="margin-bottom: 15px;">
+                            <path
+                                d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
+                        </svg>
+                        <h2 style="color: #334155; margin: 0 0 10px 0;">Trascina qui le tue Slide (PDF)</h2>
+                        <p style="color: #64748b; margin: 0;">Oppure clicca per esplorare i file</p>
+                    </div>
+                    <div id="slides-container" style="display: none; text-align: center;"></div>
                 </div>
             </div>
         </div>
 
         <div class="sidebar">
+            <!-- ECA -->
             <div class="data-card" style="padding: 0; overflow: hidden; height: 300px; position: relative;">
                 <div id="eca-container" style="width: 100%; height: 100%; background: #e2e8f0;"></div>
-
                 <div id="eca-status"
                     style="position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.6); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; z-index: 10;">
                     ECA Offline
                 </div>
-
+                <!-- Spinner ECA: solo per stato THINKING dell'ECA -->
                 <div id="thinking-spinner"
                     style="display: none; position: absolute; top: 15px; right: 15px; z-index: 10;">
                     <div class="spinner"></div>
                 </div>
             </div>
 
-            <div class="data-card" id="card-status">
+            <!-- CHAT -->
+            <div class="data-card" id="chat-container"
+                style="display: none; border-left-color: var(--secondary); height: 350px; flex-direction: column;">
+                <div class="data-title">Conversazione con Aura</div>
+                <div id="chat-box"
+                    style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; padding-right: 5px;">
+                </div>
+            </div>
+
+            <!-- METRICHE -->
+            <div class="data-card metric-card" id="card-status">
                 <div class="data-title">Stato Cognitivo (Modello Integrativo)</div>
                 <div class="data-value" id="val-status" style="font-size: 1.1rem;">In attesa di calibrazione...</div>
             </div>
 
-            <div class="data-card" style="border-left-color: #8b5cf6;">
+            <div class="data-card metric-card" style="border-left-color: #8b5cf6;">
                 <div class="data-title" style="display: flex; justify-content: space-between;">
                     <span>Input Vocale (STT)</span>
                     <span id="voice-status" style="color: #8b5cf6; font-size: 0.75rem;">Spento</span>
@@ -226,28 +366,22 @@
                 </div>
             </div>
 
-            <div class="data-card">
+            <div class="data-card metric-card">
                 <div class="data-title">Tensione Corrugatore (AU4)</div>
                 <div class="data-value" id="val-au4">0.00 σ</div>
             </div>
-            <div class="data-card">
-                <div class="data-title">Asimmetria Facciale (Confusione)</div>
-                <div class="data-value" id="val-asym">0.000</div>
-            </div>
-            <div class="data-card">
+            <div class="data-card metric-card">
                 <div class="data-title">Sforzo Visivo (EAR)</div>
                 <div class="data-value" id="val-ear">0.00 σ</div>
             </div>
-            <div class="data-card">
+            <div class="data-card metric-card">
                 <div class="data-title">Coordinate Sguardo</div>
                 <div class="data-value" id="val-gaze">X: --, Y: --</div>
             </div>
         </div>
     </div>
 
-    <!-- fflate: richiesto da FBXLoader per decomprimere i file FBX -->
     <script src="https://unpkg.com/fflate@0.8.2/umd/index.js"></script>
-
     <script type="importmap">
         {
             "imports": {
