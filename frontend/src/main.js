@@ -10,14 +10,12 @@ import { ECAController } from "./eca/ECAController.js";
 
 let video, canvas, ctx, gazeDot;
 let btnCalGaze, btnCalEmotion, calOverlay;
-
+let documentContextText = "";
 let sessionData = [];
 let currentSmoothPos = { x: 0, y: 0 };
 let currentFinalTranscript = "";
-
-let pdfTextData = [];
-let currentSlideContext = "";
-let lastGazeContextTs = 0;
+let currentGazedText = ""; 
+let textExtractionInterval = null;
 
 let faceLandmarker;
 let lastVideoTime = -1;
@@ -25,25 +23,22 @@ let lastFrameTimeMs = performance.now();
 let isGazeCalibrating = false;
 let currentNormalizedIris = null;
 
-// 🟢 NUOVO: Blocca il microfono e l'IA finché il PDF non è pronto
 let isPdfLoaded = false;
 
-// --- VARIABILI FASE PROATTIVA E CONVERSAZIONALE ---
+//PROACTIVE AND CONVERSATIONAL PHASE VARIABLES ---
 let lastProactiveIntervention = 0;
 const PROACTIVE_COOLDOWN_MS = 30000;
 let isProactiveInterventionActive = false;
-let primoInterventoFatto = false;
+let firstInterventionDone = false;
 
 let isAnsweringUser = false;
 
-// 🛡️ Filtri e Smoothing per Microfono ed Eco
+// Filters and Smoothing for Mic and Echo
 let ignoreMicUntil = 0;
 let userMicTimeout = null;
-// --------------------------------------------------
 
 let lastLogTs = 0;
 
-const GEMINI_API_KEY = "AIzaSyDl-6nqknNCjx1dxX9FRFRgH-jGHKgatTg";
 let chatHistory = [];
 let currentEmotionState = "Neutrale";
 
@@ -61,7 +56,7 @@ lumaCanvas.width = 32;
 lumaCanvas.height = 32;
 const lumaCtx = lumaCanvas.getContext('2d', { willReadFrequently: true });
 
-// ─── Aggiunge un messaggio alla chat ───
+// Adds a message to the chat
 function addChatMessage(sender, text) {
     const chatBox = document.getElementById('chat-box');
     if (!chatBox) return;
@@ -74,18 +69,17 @@ function addChatMessage(sender, text) {
     chatHistory.push({ role: sender === 'user' ? 'user' : 'model', parts: [{ text: text }] });
 }
 
-// ─── Wrapper anti-eco: blocca il microfono mentre l'ECA parla ───
-async function parlaECA(frase) {
+// Anti-echo wrapper to prevent ECA's voice from being captured
+async function speakECA(text) {
     ignoreMicUntil = Infinity;
     try {
-        await eca.speak(frase);
+        await eca.speak(text);
     } catch (e) {
-        console.error("Errore TTS:", e);
+        console.error("TTS Error:", e);
     } finally {
         ignoreMicUntil = performance.now() + 1500;
     }
 }
-// ────────────────────────────────────
 
 async function init() {
     const vision = await FilesetResolver.forVisionTasks(
@@ -107,37 +101,37 @@ async function init() {
         gazeDot.style.display = 'block';
     });
 
-    // ─── GESTIONE DEL MICROFONO UTENTE E ANIMAZIONE ASCOLTO ───
+    // Microphone management
     voiceInput = new VoiceInput((interim, final) => {
 
-        // 🟢 Se il PDF non è caricato, AURA IGNORA TUTTO QUELLO CHE DICI
+        // If PDF is not loaded, the assistant ignores everything
         if (!isPdfLoaded || performance.now() < ignoreMicUntil || isAnsweringUser || isProactiveInterventionActive) {
             return;
         }
 
         const voiceDiv = document.getElementById('val-voice');
 
-        // Se sento rumore e l'ECA è in IDLE, mettilo in LISTENING!
+        // If conditions are met, set assistant to listening
         if ((interim || final) && eca.currentState === 'IDLE') {
             eca.setState('LISTENING');
         }
 
-        // Pulisco eventuali timeout di ritorno a IDLE vecchi
+        // Cleanup any timeouts
         if (userMicTimeout) clearTimeout(userMicTimeout);
 
         if (final) {
             currentFinalTranscript = final.trim();
             voiceDiv.innerHTML = `<span style="color: #0f172a; font-weight: 600;">${final}</span>`;
-            console.log(`[UTENTE]: "${currentFinalTranscript}"`);
+            console.log(`[USER]: "${currentFinalTranscript}"`);
 
             const textLower = currentFinalTranscript.toLowerCase();
             const isWakeWordSpoken = textLower.startsWith("aura") || textLower.includes("aura");
 
             if (currentFinalTranscript.length > 5 && isWakeWordSpoken) {
-                // L'utente ha fatto una domanda vera: partiamo con il flusso!
-                gestisciDomandaUtente(currentFinalTranscript);
+                // User asked a question
+                manageUserQuestion(currentFinalTranscript);
             } else {
-                // Falso allarme (es. un colpo di tosse o parola breve), torna in IDLE
+                // False alarm
                 eca.setState('IDLE');
             }
 
@@ -146,8 +140,8 @@ async function init() {
         } else if (interim) {
             voiceDiv.innerHTML = `<span style="font-style: italic;">${interim}...</span>`;
 
-            // Imposta un timer di sicurezza: se entro 1.5s non arriva una parola nuova o una conferma (final), 
-            // significa che l'utente ha smesso di parlare senza generare una frase valida. Torna in IDLE.
+            // Security timer: if no new word or final confirmation arrives within 1.5s,
+            // it means the user stopped speaking without generating a valid sentence. Return to IDLE.
             userMicTimeout = setTimeout(() => {
                 if (eca.currentState === 'LISTENING') {
                     eca.setState('IDLE');
@@ -158,97 +152,74 @@ async function init() {
         document.getElementById('voice-status').innerText = statusMessage;
     });
 
-    // Avvio microfono qui per avere i permessi, ma bloccato dalla logica sopra!
-    voiceInput.start();
-
     try {
         await eca.loadModel('./models/personaggio.fbx');
-        console.log("✅ Modello 3D caricato con successo!");
+        console.log("3D Model loaded successfully!");
     } catch (error) {
-        console.error("❌ Errore caricamento modello 3D:", error);
+        console.error("Error loading 3D model:", error);
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
     video.srcObject = stream;
     video.addEventListener('loadeddata', loop);
+
+    // --- RECOVERY GAZE CALIBRATION IN RAM ---
+    if (gazeCalibrator.loadFromStorage && gazeCalibrator.loadFromStorage()) {
+        console.log("[AURA] Gaze calibration successfully recovered from session.");
+        gazeDot.style.display = 'block';
+    } else {
+        console.log("[AURA] No previous calibration found in this session.");
+    }
 }
 
-// ─── Chiamata a Gemini ───
-async function fetchGeminiResponse(userText) {
-    if (!GEMINI_API_KEY) return "Errore API KEY.";
-
-    const slideContextLine = currentSlideContext.trim()
-        ? `L'utente sta guardando questa parte della slide: "${currentSlideContext.trim()}".`
-        : '';
-    const systemPrompt = `Sei Aura, un tutor didattico virtuale.
-L'utente sembra: ${currentEmotionState}.
-${slideContextLine}
-REGOLE: 1. NON presentarti mai. 2. Vai dritto al sodo. 3. Sii concisa (max 3 frasi). 4. Solo testo semplice. ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare LaTeX, vietati gli asterischi (*), vietato il simbolo del dollaro ($). Scrivi le formule matematiche a parole in italiano (es. "a al quadrato più b al quadrato uguale c al quadrato").`;
-
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
-
-    const contents = [
-        { role: "user", parts: [{ text: systemPrompt }] },
-        { role: "model", parts: [{ text: "Ricevuto." }] },
-        ...chatHistory.slice(-10),
-        { role: "user", parts: [{ text: userText }] }
-    ];
+async function fetchLLMResponse(userText) {
+    const url = "http://localhost:8000/api/chat";
+    
+    // Secure payload preparation
+    const payload = {
+        user_text: userText,
+        emotion_state: currentEmotionState,
+        slide_context: (isPdfLoaded && documentContextText !== "") ? documentContextText : ""
+    };
 
     try {
         const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: contents })
+            body: JSON.stringify(payload)
         });
+        
+        if (!response.ok) throw new Error("Network error with Proxy");
         const data = await response.json();
-        return data.candidates[0].content.parts[0].text;
+        
+        return data.text;
     } catch (e) {
-        return "Errore di connessione.";
+        console.error(e);
+        return "Connection error with central system.";
     }
 }
 
-// ─── FLUSSO CONVERSAZIONALE LLM ───
-async function gestisciDomandaUtente(domandaText) {
+// LLM CONVERSATIONAL FLOW
+async function manageUserQuestion(questionText) {
     if (isAnsweringUser || isProactiveInterventionActive) return;
 
     isAnsweringUser = true;
 
-    addChatMessage('user', domandaText);
-    // Risponde per dire "Ho capito"
-    await parlaECA("Certo, dammi un secondo.");
+    addChatMessage('user', questionText);
+    // Responds to acknowledge
+    await speakECA("Certo, dammi un secondo.");
 
-    // ORA entra in THINKING mentre simula la ricerca su LLM
-    console.log("🧠 [AURA] Sto pensando alla risposta...");
+    // NOW enters THINKING while simulating LLM search
+    console.log("[AURA] Thinking about the response...");
     eca.setState('THINKING');
 
-    const aiResponseTesto = await fetchGeminiResponse(domandaText);
-    addChatMessage('ai', aiResponseTesto);
-    await parlaECA(aiResponseTesto);
+    const llmResponseText = await fetchLLMResponse(questionText);
+    addChatMessage('ai', llmResponseText);
+    await speakECA(llmResponseText);
 
     lastProactiveIntervention = performance.now();
     isAnsweringUser = false;
     eca.setState('IDLE');
-}
-
-function extractGazedText() {
-    if (pdfTextData.length === 0) return "";
-    const canvases = document.querySelectorAll('.pdf-slide');
-    for (let i = 0; i < canvases.length; i++) {
-        const rect = canvases[i].getBoundingClientRect();
-        if (currentSmoothPos.x >= rect.left && currentSmoothPos.x <= rect.right &&
-            currentSmoothPos.y >= rect.top  && currentSmoothPos.y <= rect.bottom) {
-            if (!pdfTextData[i]) return "";
-            const localX = currentSmoothPos.x - rect.left;
-            const localY = currentSmoothPos.y - rect.top;
-            const RADIUS = 80;
-            const nearby = pdfTextData[i].items
-                .filter(item => Math.hypot(item.x - localX, item.y - localY) < RADIUS)
-                .map(item => item.text.trim())
-                .filter(t => t.length > 0);
-            return nearby.join(' ');
-        }
-    }
-    return "";
 }
 
 function drawFaceMeshSegments(landmarks) {
@@ -311,7 +282,6 @@ async function loop() {
 
                 const rawPos = gazeCalibrator.predict(depthCorrectedX, depthCorrectedY);
 
-                // 🟢 FIX CRASH: Se rawPos è valido, muovi il pallino
                 if (rawPos) {
                     const smoothPos = uiFilter.filter(rawPos.x, rawPos.y, ts);
                     currentSmoothPos = smoothPos;
@@ -319,11 +289,6 @@ async function loop() {
                     gazeDot.style.left = `${smoothPos.x}px`;
                     gazeDot.style.top = `${smoothPos.y}px`;
                     document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
-
-                    if (isPdfLoaded && ts - lastGazeContextTs > 500) {
-                        lastGazeContextTs = ts;
-                        currentSlideContext = extractGazedText();
-                    }
                 }
             }
 
@@ -332,17 +297,17 @@ async function loop() {
                 if (done) {
                     calOverlay.style.display = 'none';
                     document.getElementById('val-status').innerText = "Calibrazione completata. Rilevamento attivo.";
-                    console.log("✅ Calibrazione emotiva completata!");
+                    console.log("Emotional calibration completed!");
 
                     setTimeout(async () => {
                         isProactiveInterventionActive = true;
                         try {
-                            const saluto = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
-                            addChatMessage('ai', saluto);
-                            await parlaECA(saluto);
+                            const greetingMessage = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
+                            addChatMessage('ai', greetingMessage);
+                            await speakECA(greetingMessage);
                         } finally {
                             isProactiveInterventionActive = false;
-                            console.log("✅ [AURA] Presentazione conclusa, in ascolto.");
+                            console.log("[AURA] Presentation concluded, listening.");
                         }
                     }, 1000);
                 }
@@ -353,7 +318,7 @@ async function loop() {
                     lastLogTs = ts;
                 }
 
-                // Aggiorna stato emotivo per Gemini
+                // Update emotional state for LLM
                 if (state.isFrustrated) currentEmotionState = "Molto Frustrato";
                 else if (state.isConfused) currentEmotionState = "Confuso";
                 else currentEmotionState = "Attento";
@@ -385,27 +350,28 @@ async function loop() {
                     }
                 }
 
-                // ─── INTERVENTO PROATTIVO ───
                 const timeSinceLastIntervention = ts - lastProactiveIntervention;
-                const cooldownPassato = timeSinceLastIntervention > PROACTIVE_COOLDOWN_MS;
-                const puoIntervenireTempo = !primoInterventoFatto || cooldownPassato;
+                const isCooldownPassed = timeSinceLastIntervention > PROACTIVE_COOLDOWN_MS;
+                const canInterveneTime = !firstInterventionDone || isCooldownPassed;
 
-                // 🟢 AURA INTERVIENE SOLO SE LE SLIDE SONO CARICATE (isPdfLoaded)
-                if (isPdfLoaded && (state.isFrustrated || state.isConfused) && puoIntervenireTempo && !isProactiveInterventionActive && !isAnsweringUser) {
-                    console.log(`🤖 [AURA] Intervento INNESCATO!`);
-
+                if (isPdfLoaded && (state.isFrustrated || state.isConfused) && canInterveneTime && !isProactiveInterventionActive && !isAnsweringUser) {
+                    console.log(`[AURA] Intervention TRIGGERED! Generating intelligent response...`);
                     isProactiveInterventionActive = true;
-                    primoInterventoFatto = true;
+                    firstInterventionDone = true;
                     lastProactiveIntervention = ts;
+                    
+                    eca.setState('THINKING');
 
-                    const fraseIntervento = state.isConfused
-                        ? "Vedo che sei un po' confuso. C'è qualche concetto di questo argomento che vorresti che ti rispiegassi?"
-                        : "Sembri frustrato. Vuoi che facciamo una piccola pausa o preferisci affrontare questo passaggio insieme?";
+                    const hiddenPrompt = state.isConfused
+                        ? "L'utente mostra confusione guardando l'attuale slide. Formula una brevissima domanda (massimo 15 parole) proponendo di rispiegare un termine tecnico specifico presente nel testo."
+                        : "L'utente mostra segni di frustrazione o sovraccarico cognitivo. Fagli una brevissima proposta empatica (massimo 15 parole) citando l'argomento della slide per aiutarlo a sbloccarsi.";
 
-                    addChatMessage('ai', fraseIntervento);
-                    parlaECA(fraseIntervento).then(() => {
-                        console.log("⏳ [AURA] Intervento concluso.");
-                        isProactiveInterventionActive = false;
+                    fetchLLMResponse(hiddenPrompt).then(interventionPhrase => {
+                        addChatMessage('ai', interventionPhrase);
+                        speakECA(interventionPhrase).then(() => {
+                            console.log("[AURA] Intervention concluded.");
+                            isProactiveInterventionActive = false;
+                        });
                     });
                 }
 
@@ -453,16 +419,20 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCalEmotion.onclick = () => {
         btnCalEmotion.blur();
 
+        if (voiceInput && !voiceInput.isListening) {
+            voiceInput.start();
+        }
+
         eca.currentAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
         eca.currentAudio.play().catch(() => { });
 
         calOverlay.style.display = 'block';
         document.getElementById('val-status').innerText = "Acquisizione Baseline...";
         affectAnalyzer.startCalibration();
-        console.log("🎯 Calibrazione emotiva avviata...");
+        console.log("Emotional calibration started...");
     };
 
-    // ── TASTO SPAZIO: registra punto di calibrazione sguardo ──
+    // --- SPACEBAR: records gaze calibration point ---
     window.addEventListener('keydown', (e) => {
         if (e.code === 'Space' && isGazeCalibrating) {
             e.preventDefault();
@@ -502,7 +472,7 @@ document.addEventListener("DOMContentLoaded", () => {
         };
     }
 
-    // ── Bottoni vista PDF / Webcam ──
+    // --- PDF / Webcam View Buttons ---
     const btnShowPdf = document.getElementById('btn-show-pdf');
     const btnShowCam = document.getElementById('btn-show-cam');
 
@@ -530,7 +500,6 @@ document.addEventListener("DOMContentLoaded", () => {
         };
     }
 
-    // ── Gestione PDF ──
     const dropZone = document.getElementById('pdf-drop-zone');
     const inputPdf = document.getElementById('input-pdf');
     const slidesContainer = document.getElementById('slides-container');
@@ -549,13 +518,11 @@ document.addEventListener("DOMContentLoaded", () => {
         const pdfjsLib = window['pdfjs-dist/build/pdf'];
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-        // Mostra spinner PDF e nascondi drop zone
         if (dropZone) dropZone.style.display = 'none';
         if (slidesContainer) slidesContainer.style.display = 'none';
         if (pdfSpinner) pdfSpinner.style.display = 'block';
 
-        // Voce in parallelo — non aspettiamo che finisca
-        const auraPromise = parlaECA("Sto caricando le slide e ci vorrà poco tempo.");
+        const auraPromise = speakECA("Sto analizzando le slide, preparo il livello semantico.");
 
         const fileReader = new FileReader();
         fileReader.onload = async function () {
@@ -563,55 +530,140 @@ document.addEventListener("DOMContentLoaded", () => {
                 const pdf = await pdfjsLib.getDocument(new Uint8Array(this.result)).promise;
                 slidesContainer.innerHTML = '';
                 slidesContainer.style.display = 'block';
-                pdfTextData = [];
-                currentSlideContext = "";
+                
+                // Resetta il contesto precedente
+                documentContextText = "";
 
                 for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
                     const page = await pdf.getPage(pageNum);
                     const viewport = page.getViewport({ scale: 1.5 });
+
+                    // Creazione del wrapper per Canvas + TextLayer
+                    const pageWrapper = document.createElement('div');
+                    pageWrapper.style.position = 'relative';
+                    pageWrapper.style.margin = '0 auto 30px auto';
+                    pageWrapper.style.width = `${viewport.width}px`;
+                    pageWrapper.style.height = `${viewport.height}px`;
+                    pageWrapper.className = 'pdf-slide-wrapper';
+                    
                     const slideCanvas = document.createElement('canvas');
-                    slideCanvas.id = "slide_" + pageNum;
-                    slideCanvas.className = 'pdf-slide';
+                    slideCanvas.className = 'pdf-slide-canvas';
                     slideCanvas.height = viewport.height;
                     slideCanvas.width = viewport.width;
-                    slidesContainer.appendChild(slideCanvas);
-                    await page.render({ canvasContext: slideCanvas.getContext('2d'), viewport: viewport }).promise;
-
+                    slideCanvas.style.display = 'block';
+                    
+                    pageWrapper.appendChild(slideCanvas);
+                    slidesContainer.appendChild(pageWrapper);
+                    
+                    const renderTask = page.render({ canvasContext: slideCanvas.getContext('2d'), viewport: viewport }).promise;
+                    
+                    // 2. Creazione del TEXT LAYER invisibile per l'Hit Testing
                     const textContent = await page.getTextContent();
-                    const items = textContent.items
-                        .filter(item => item.str && item.str.trim().length > 0)
-                        .map(item => {
-                            const tx = item.transform[4];
-                            const ty = item.transform[5];
-                            const vx = tx * viewport.scale;
-                            const vy = viewport.height - ty * viewport.scale;
-                            return { text: item.str, x: vx, y: vy };
-                        });
-                    pdfTextData.push({ items });
+                    
+                    const textLayerDiv = document.createElement('div');
+                    textLayerDiv.className = 'textLayer';
+                    textLayerDiv.style.position = 'absolute';
+                    textLayerDiv.style.left = '0';
+                    textLayerDiv.style.top = '0';
+                    textLayerDiv.style.right = '0';
+                    textLayerDiv.style.bottom = '0';
+                    textLayerDiv.style.overflow = 'hidden';
+                    textLayerDiv.style.opacity = '0'; // Invisibile ma interattivo
+                    pageWrapper.appendChild(textLayerDiv);
+
+                    await renderTask;
+
+                    pdfjsLib.renderTextLayer({
+                        textContentSource: textContent,
+                        container: textLayerDiv,
+                        viewport: viewport,
+                        textDivs: []
+                    });
                 }
 
-                // Aspetta che l'avatar finisca di dire la prima frase, se non l'ha già fatto
                 await auraPromise;
-
-                // ── Spinner si nasconde SOLO dopo tutte le slide nel DOM ──
+                
                 if (pdfSpinner) pdfSpinner.style.display = 'none';
-
-                const msg = `Caricamento completato. Ci sono ${pdf.numPages} pagine. Chiamami dicendo "Aura" per farmi una domanda.`;
+                const msg = `Caricamento completato. Ora posso capire esattamente quale frase stai leggendo.`;
                 addChatMessage('ai', msg);
-                await parlaECA(msg);
-
-                // 🟢 SBLOCCA IL MICROFONO E GLI INTERVENTI PROATTIVI
+                await speakECA(msg);
+                
                 isPdfLoaded = true;
-                lastProactiveIntervention = performance.now(); // Resetta il cooldown per evitare spam immediato
-                console.log("✅ PDF caricato. Aura è in ascolto e pronta a intervenire.");
+                lastProactiveIntervention = performance.now();
 
+                // 3. Avvia il polling per l'Hit Testing semantico (Gaze-Contingency)
+                if (textExtractionInterval) clearInterval(textExtractionInterval);
+                textExtractionInterval = setInterval(extractGazedText, 500); // Controlla cosa guardi ogni 500ms
+                
             } catch (error) {
                 console.error(error);
                 if (pdfSpinner) pdfSpinner.style.display = 'none';
-                alert("Errore durante il caricamento del PDF.");
+                alert("Errore critico durante il parsing del PDF.");
             }
         };
         fileReader.readAsArrayBuffer(file);
+    }
+
+    // ── Funzione Gaze-Contingent: Estrae il testo sotto gli occhi ──
+    function extractGazedText() {
+        if (!isPdfLoaded || isGazeCalibrating) return;
+
+        // Disabilita temporaneamente il pointer-events del puntino rosso 
+        // per non intercettare se stesso durante l'elementFromPoint
+        const wasGazeDotPointerEvents = gazeDot.style.pointerEvents;
+        gazeDot.style.pointerEvents = 'none';
+
+        // Hit Testing
+        const element = document.elementFromPoint(currentSmoothPos.x, currentSmoothPos.y);
+        
+        // Se l'elemento è uno span generato dal TextLayer di PDF.js
+        if (element && element.parentNode && element.parentNode.classList.contains('textLayer')) {
+            // Non prendiamo solo la singola parola, ma unisciamo i testi vicini 
+            // per dare all'LLM una frase sensata (Contesto locale)
+            const siblings = Array.from(element.parentNode.childNodes);
+            const index = siblings.indexOf(element);
+            
+            // Prende le 3 parole prima e le 6 parole dopo per formare un costrutto logico
+            const start = Math.max(0, index - 3);
+            const end = Math.min(siblings.length, index + 6);
+            
+            const contextSnippet = siblings.slice(start, end).map(el => el.textContent).join(' ');
+            
+            if (contextSnippet.trim().length > 5) {
+                currentGazedText = contextSnippet;
+                // Debug opzionale: console.log("Gazed Context:", currentGazedText);
+            }
+        }
+
+        gazeDot.style.pointerEvents = wasGazeDotPointerEvents;
+    }
+
+    // Infine, aggiorniamo il payload verso l'LLM (sia proattivo che conversazionale)
+    async function fetchLLMResponse(userText) {
+        const url = "http://localhost:8000/api/chat";
+        
+        // Invia ESATTAMENTE il testo che l'utente sta fissando in quel momento
+        const payload = {
+            user_text: userText,
+            emotion_state: currentEmotionState,
+            slide_context: (isPdfLoaded && currentGazedText !== "") ? currentGazedText : ""
+        };
+
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            
+            if (!response.ok) throw new Error("Network error with Proxy");
+            const data = await response.json();
+            
+            return data.text;
+        } catch (e) {
+            console.error(e);
+            return "Connection error with central system.";
+        }
     }
 
     init();

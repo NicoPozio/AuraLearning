@@ -273,6 +273,23 @@
             animation: spin 1s linear infinite;
             margin: 0 auto;
         }
+        .textLayer {
+            position: absolute;
+            left: 0;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            overflow: hidden;
+            opacity: 0; /* Mantiene il testo invisibile ma tracciabile dal mouse/gaze */
+            line-height: 1.0;
+        }
+        .textLayer > span {
+            color: transparent;
+            position: absolute;
+            white-space: pre;
+            cursor: text;
+            transform-origin: 0% 0%;
+        }
 
         @keyframes spin {
             to {

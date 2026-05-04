@@ -1,5 +1,6 @@
 export class AffectAnalyzer {
-    constructor() {
+    constructor(loggerCallback) {
+        this.log = loggerCallback || (() => {});
         this.isCalibrating = false;
         this.isCalibrated = false;
         this.samples = [];
@@ -8,6 +9,7 @@ export class AffectAnalyzer {
             ear: { mean: 0, std: 1 },
             lipPress: { mean: 0, std: 1 },
             browAsymmetry: { mean: 0, std: 1 },
+            smile: { mean: 0, std: 1 },
             iod: 0.20
         };
 
@@ -17,10 +19,10 @@ export class AffectAnalyzer {
 
         this.currentStateFrustrated = false;
         this.currentStateBored = false;
+        this.lastReportedState = "";
 
         this.headPoseHistory = [];
         this.lipHistory = [];
-        this.zHistory = { corrugator: [], ear: [], lip: [] };
     }
 
     startCalibration() {
@@ -31,6 +33,7 @@ export class AffectAnalyzer {
         this.boredomAccumulator = 0.0;
         this.currentStateFrustrated = false;
         this.currentStateBored = false;
+        this.lastReportedState = "";
     }
 
     processCalibrationSample(metrics) {
@@ -59,9 +62,10 @@ export class AffectAnalyzer {
             };
 
             this.baseline.corrugator = calculateStats('corrugator', 0.008);
-            this.baseline.ear = calculateStats('ear', 0.025);
+            this.baseline.ear = calculateStats('ear', 0.020);
             this.baseline.lipPress = calculateStats('lipPress', 0.010);
             this.baseline.browAsymmetry = calculateStats('browAsymmetry', 0.008);
+            this.baseline.smile = calculateStats('smileIntensity', 0.010);
 
             this.isCalibrating = false;
             this.isCalibrated = true;
@@ -90,9 +94,7 @@ export class AffectAnalyzer {
         if (this.headPoseHistory.length > 30) {
             const headMeanX = this.headPoseHistory.reduce((a, b) => a + b.x, 0) / this.headPoseHistory.length;
             const headMeanY = this.headPoseHistory.reduce((a, b) => a + b.y, 0) / this.headPoseHistory.length;
-            headVariance = this.headPoseHistory.reduce((a, b) =>
-                a + Math.pow(b.x - headMeanX, 2) + Math.pow(b.y - headMeanY, 2), 0
-            ) / this.headPoseHistory.length;
+            headVariance = this.headPoseHistory.reduce((a, b) => a + Math.pow(b.x - headMeanX, 2) + Math.pow(b.y - headMeanY, 2), 0) / this.headPoseHistory.length;
         }
         const normalizedHeadVar = headVariance / (metrics.iod * metrics.iod + 1e-6);
         const isFaceStatic = normalizedHeadVar < 0.015;
@@ -101,36 +103,18 @@ export class AffectAnalyzer {
         const zEar = (this.baseline.ear.mean - metrics.ear) / this.baseline.ear.std;
         const zLip = (this.baseline.lipPress.mean - metrics.lipPress) / this.baseline.lipPress.std;
         const zAsymmetry = (metrics.browAsymmetry - this.baseline.browAsymmetry.mean) / this.baseline.browAsymmetry.std;
+        const zSmile = (metrics.smileIntensity - this.baseline.smile.mean) / this.baseline.smile.std;
 
-        const poseConfidence = metrics.iod && this.baseline.iod > 0
-            ? Math.min(1.0, metrics.iod / this.baseline.iod)
-            : 1.0;
+        const poseConfidence = metrics.iod && this.baseline.iod > 0 ? Math.min(1.0, metrics.iod / this.baseline.iod) : 1.0;
 
-        // Media mobile su 6 frame: elimina spike da singoli frame rumorosi
-        const ZWIN = 6;
-        const _pushZ = (buf, v) => { buf.push(v); if (buf.length > ZWIN) buf.shift(); };
-        const _avgZ = buf => buf.reduce((a, b) => a + b, 0) / buf.length;
-        _pushZ(this.zHistory.corrugator, zCorrugator);
-        _pushZ(this.zHistory.ear, zEar);
-        _pushZ(this.zHistory.lip, zLip);
-        const zCorrSmooth = _avgZ(this.zHistory.corrugator);
-        const zEarSmooth = _avgZ(this.zHistory.ear);
-        const zLipSmooth = _avgZ(this.zHistory.lip);
+        const zEarClamped = Math.min(Math.abs(zEar), 3.0) * Math.sign(zEar);
 
-        // Clamping sull'EAR smoothed per evitare che valori estremi dominino
-        const zEarClamped = Math.min(Math.abs(zEarSmooth), 3.0) * Math.sign(zEarSmooth);
-
-        // Dead-zone: solo l'eccesso sopra soglia contribuisce all'accumulo.
-        // Con la soglia a 1.0σ anche microvariazioni naturali alimentavano l'accumulo;
-        // ora a 1.5σ il segnale deve essere inequivocabile prima di accumulare.
-        const actCorr = zCorrSmooth > 1.5 ? (zCorrSmooth - 1.5) * poseConfidence : 0;
-        const actEar  = zEarClamped  > 2.0 ? (zEarClamped  - 2.0) : 0;
-        const actLip  = zLipSmooth   > 1.8 ? (zLipSmooth   - 1.8) : 0;
+        const actCorr = zCorrugator > 1.2 ? zCorrugator * poseConfidence : 0;
+        const actEar = zEarClamped > 1.5 ? zEarClamped : 0;
+        const actLip = (zLip > 1.8 && !isSpeaking) ? zLip : 0;
 
         let stressDelta = (actCorr * 2.0) + (actEar * 0.5) + (actLip * 0.8);
-
-        // Confusione: usa valori smoothed per ridurre falsi positivi
-        const isConfused = (zCorrSmooth > 1.0) && (zAsymmetry > 1.8);
+        const isConfused = (zCorrugator > 1.0) && (zAsymmetry > 2.0);
 
         let boredomDelta = 0;
         if (isFaceStatic && zEar > 1.2 && zCorrugator < 0.5) {
@@ -141,30 +125,49 @@ export class AffectAnalyzer {
             this.boredomAccumulator *= 0.5;
         }
 
-        if (this.stressAccumulator < 40 && boredomDelta === 0 && !isSpeaking && !isConfused) {
+        if (this.stressAccumulator < 20 && boredomDelta === 0 && !isSpeaking && !isConfused) {
             const alpha = 0.1 * dtSec;
             this.baseline.corrugator.mean = (1 - alpha) * this.baseline.corrugator.mean + alpha * metrics.corrugator;
             this.baseline.ear.mean = (1 - alpha) * this.baseline.ear.mean + alpha * metrics.ear;
             this.baseline.lipPress.mean = (1 - alpha) * this.baseline.lipPress.mean + alpha * metrics.lipPress;
         }
 
-        const incrementoStress = stressDelta * 18.0 * dtSec;
-        const decadimentoStress = 30.0 * dtSec;
-        // Scarico attivo: se il viso è chiaramente rilassato si drena più velocemente
-        const isRelaxed = zCorrSmooth < 0.3 && zEarSmooth < 0.5 && zLipSmooth < 0.5;
-        const drainExtra = isRelaxed ? 25.0 * dtSec : 0;
-        this.stressAccumulator += (incrementoStress - decadimentoStress - drainExtra);
-        this.stressAccumulator = Math.max(0, Math.min(this.stressAccumulator, this.activationThreshold));
+        // Valvola Sorriso (Eureka Moment)
+        if (zSmile > 2.0) {
+            if (this.stressAccumulator > 10) this.log(`Eureka Moment (Z-Smile: ${zSmile.toFixed(1)}). Stress abbattuto.`, "INFO");
+            this.stressAccumulator = Math.max(0, this.stressAccumulator - (40.0 * dtSec));
+        } else {
+            if (stressDelta > 0 && this.stressAccumulator < 10) {
+                this.log(`Inizio accumulo stress (AU4: ${actCorr.toFixed(1)}, EAR: ${actEar.toFixed(1)})`, "WARN");
+            }
+            
+            const incrementoStress = stressDelta * 18.0 * dtSec;
+            const decadimentoStress = 30.0 * dtSec;
+            this.stressAccumulator += (incrementoStress - decadimentoStress);
+            this.stressAccumulator = Math.max(0, Math.min(this.stressAccumulator, this.activationThreshold));
+        }
 
         const decadimentoNoia = 10.0 * dtSec;
         this.boredomAccumulator += (boredomDelta - decadimentoNoia);
         this.boredomAccumulator = Math.max(0, Math.min(this.boredomAccumulator, this.activationThreshold));
 
-        // Isteresi: scatta a 80, si spegne sotto 35
-        if (this.stressAccumulator >= 80) {
+        if (boredomDelta > 0 && this.boredomAccumulator < 10) {
+            this.log("Viso statico e occhi stanchi. Inizio accumulo noia.", "WARN");
+        }
+
+        if (isConfused && this.lastReportedState !== "CONFUSED") {
+            this.log(`Confusione rilevata: AU4 (${zCorrugator.toFixed(1)}) + Asimmetria (${zAsymmetry.toFixed(1)})`, "ALERT");
+            this.lastReportedState = "CONFUSED";
+        }
+
+        if (this.stressAccumulator >= 80 && !this.currentStateFrustrated) {
+            this.log("SOVRACCARICO COGNITIVO confermato (Soglia 80 superata).", "ALERT");
             this.currentStateFrustrated = true;
-        } else if (this.stressAccumulator < 35) {
+            this.lastReportedState = "FRUSTRATED";
+        } else if (this.stressAccumulator < 35 && this.currentStateFrustrated) {
+            this.log("Recupero completato. Stress sceso sotto 35.", "INFO");
             this.currentStateFrustrated = false;
+            this.lastReportedState = "NORMAL";
         }
 
         if (this.boredomAccumulator >= 80) {
@@ -174,9 +177,9 @@ export class AffectAnalyzer {
         }
 
         return {
-            zCorrugator: zCorrSmooth,
-            zEar: zEarSmooth,
-            zLip: zLipSmooth,
+            zCorrugator,
+            zEar,
+            zLip,
             isFrustrated: this.currentStateFrustrated,
             isBored: this.currentStateBored,
             isConfused: isConfused,

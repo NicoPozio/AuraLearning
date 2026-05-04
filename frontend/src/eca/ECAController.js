@@ -218,38 +218,26 @@ export class ECAController {
 
     async speak(text) {
         if (this.audioContext && this.audioContext.state === 'suspended') this.audioContext.resume();
-
         this.currentAudio.pause();
-
-        const apiKey = 'sk_1d4eb2e9f5320c67c7685115fd9b16a5d47dda948e334a88';
-        const voiceId = 'N2lVS1w4EtoT3dr4eOWO'; // Callum
-
+        
         try {
-            console.log(`☁️ [AURA] Generazione TTS: "${text}"`);
-
-            const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?optimize_streaming_latency=3`, {
+            console.log(`[AURA] Richiesta TTS al Proxy: "${text}"`);
+            
+            //Chiamata diretta al server locale
+            const response = await fetch("http://localhost:8000/api/tts", {
                 method: 'POST',
-                headers: {
-                    'Accept': 'audio/mpeg',
-                    'xi-api-key': apiKey,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    text: text,
-                    model_id: 'eleven_multilingual_v2',
-                    voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-                })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text })
             });
 
             if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(`${response.status} - ${errorData.detail?.message || JSON.stringify(errorData)}`);
+                throw new Error(`Errore Proxy: HTTP ${response.status}`);
             }
 
             const blob = await response.blob();
             const audioUrl = URL.createObjectURL(blob);
 
-            // Pulizia eventi precedenti
+            //Pulizia eventi precedenti
             this.currentAudio.onplay = null;
             this.currentAudio.onended = null;
             this.currentAudio.onerror = null;

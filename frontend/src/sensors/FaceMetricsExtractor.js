@@ -22,9 +22,12 @@ export class FaceMetricsExtractor {
     static LIP_UPPER_INNER = 13;
     static LIP_LOWER_INNER = 14;
 
+    // Aggiunto per il rilevamento del Sorriso (AU12)
+    static LIP_LEFT_CORNER = 61;
+    static LIP_RIGHT_CORNER = 291;
+
     static NOSE_TIP = 1;
 
-    // Struttura dati per il rendering grafico sul Canvas (Ripristinata)
     static RENDER_SEGMENTS = {
         brows: [46, 53, 52, 65, 55, 285, 295, 282, 283, 276],
         leftEye: [33, 160, 158, 133, 153, 144, 33],
@@ -47,22 +50,12 @@ export class FaceMetricsExtractor {
 
         if (iod < 1e-5) return null;
 
-        const leftBrowDrop = this._dist(
-            landmarks[this.LEFT_INNER_BROW],
-            landmarks[this.LEFT_EYE_CENTER]
-        );
-        const rightBrowDrop = this._dist(
-            landmarks[this.RIGHT_INNER_BROW],
-            landmarks[this.RIGHT_EYE_CENTER]
-        );
+        const leftBrowDrop = this._dist(landmarks[this.LEFT_INNER_BROW], landmarks[this.LEFT_EYE_CENTER]);
+        const rightBrowDrop = this._dist(landmarks[this.RIGHT_INNER_BROW], landmarks[this.RIGHT_EYE_CENTER]);
 
-        // AU4: Contrazione del corrugatore (media bilanciata)
         const corrugator = ((leftBrowDrop + rightBrowDrop) / 2) / iod;
-
-        // Estrazione dell'Asimmetria (Fondamentale per identificare la Confusione)
         const browAsymmetry = Math.abs(leftBrowDrop - rightBrowDrop) / iod;
 
-        // EAR (Ammiccamento / Squint)
         const lEyeH = this._dist(landmarks[this.L_EYE_TOP], landmarks[this.L_EYE_BOTTOM]);
         const lEyeW = this._dist(landmarks[this.L_EYE_INNER], landmarks[this.LEFT_OUTER_EYE]);
         const rEyeH = this._dist(landmarks[this.R_EYE_TOP], landmarks[this.R_EYE_BOTTOM]);
@@ -72,12 +65,14 @@ export class FaceMetricsExtractor {
         const earRight = rEyeW > 1e-5 ? rEyeH / rEyeW : 0;
         const ear = (earLeft + earRight) / 2;
 
-        // LIP PRESS (Labbra serrate / Rilevamento empirico di movimento vocale)
         const outerLipH = this._dist(landmarks[this.LIP_UPPER_OUTER], landmarks[this.LIP_LOWER_OUTER]);
         const innerLipH = this._dist(landmarks[this.LIP_UPPER_INNER], landmarks[this.LIP_LOWER_INNER]);
         const lipPress = outerLipH > 1e-5 ? innerLipH / outerLipH : 0;
 
-        // Estrazione coordinate nasali per analisi postura temporale nel dominio della noia
+        // Estrazione Sorriso
+        const mouthWidth = this._dist(landmarks[this.LIP_LEFT_CORNER], landmarks[this.LIP_RIGHT_CORNER]);
+        const smileIntensity = mouthWidth / iod;
+
         const noseTip = landmarks[this.NOSE_TIP];
 
         return { 
@@ -86,6 +81,7 @@ export class FaceMetricsExtractor {
             lipPress, 
             iod, 
             browAsymmetry,
+            smileIntensity,
             noseX: noseTip.x,
             noseY: noseTip.y 
         };

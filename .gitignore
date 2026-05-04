@@ -1,0 +1,7 @@
+# Cartella temporanea di Claude Code
+.claude/
+
+# Eventuali altre cartelle inutili (consigliato)
+node_modules/
+.DS_Store
+*.log
