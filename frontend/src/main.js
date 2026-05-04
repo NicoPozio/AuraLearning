@@ -10,11 +10,13 @@ import { ECAController } from "./eca/ECAController.js";
 
 let video, canvas, ctx, gazeDot;
 let btnCalGaze, btnCalEmotion, calOverlay;
-let documentContextText = "";
 let sessionData = [];
 let currentSmoothPos = { x: 0, y: 0 };
 let currentFinalTranscript = "";
-let currentGazedText = ""; 
+let currentGazedText = "";
+let lastGazedTextTimestamp = 0;
+const GAZE_CONTEXT_TTL_MS = 4000;
+let _lastExtractedSnippet = "";
 let textExtractionInterval = null;
 
 let faceLandmarker;
@@ -22,25 +24,36 @@ let lastVideoTime = -1;
 let lastFrameTimeMs = performance.now();
 let isGazeCalibrating = false;
 let currentNormalizedIris = null;
-
 let isPdfLoaded = false;
 
-//PROACTIVE AND CONVERSATIONAL PHASE VARIABLES ---
+// Proactive intervention
 let lastProactiveIntervention = 0;
 const PROACTIVE_COOLDOWN_MS = 30000;
 let isProactiveInterventionActive = false;
 let firstInterventionDone = false;
-
 let isAnsweringUser = false;
 
-// Filters and Smoothing for Mic and Echo
+// Negative state persistence timer
+let negativeStateStartTime = 0;
+const NEGATIVE_STATE_PERSIST_MS = 5000;
+
+// Multi-frame gaze calibration
+const GAZE_SAMPLE_COUNT = 30;
+let gazeSampleBuffer = [];
+let isCollectingGazeSample = false;
+
+// ── STT state ──────────────────────────────────────────────────────────────
+// FIX: wake word usa regex con word boundary — evita "paura", "laura", ecc.
+const WAKE_WORD_RE = /\baura\b/i;
+
+// Motivo del blocco mic — mostrato nella UI al posto del generico "Spento"
+// Valori: null | 'echo' | 'pdf' | 'answering' | 'intervention' | 'calibrating'
+let micBlockReason = null;
+
 let ignoreMicUntil = 0;
 let userMicTimeout = null;
-
-let lastLogTs = 0;
-
 let chatHistory = [];
-let currentEmotionState = "Neutrale";
+let currentEmotionState = "Normale";
 
 const affectAnalyzer = new AffectAnalyzer();
 const eca = new ECAController('eca-container');
@@ -51,41 +64,91 @@ const gazeEstimator = new GazeEstimator();
 let calibrationUI;
 let voiceInput;
 
-const lumaCanvas = document.createElement('canvas');
-lumaCanvas.width = 32;
-lumaCanvas.height = 32;
-const lumaCtx = lumaCanvas.getContext('2d', { willReadFrequently: true });
+// ── Helpers ────────────────────────────────────────────────────────────────
 
-// Adds a message to the chat
 function addChatMessage(sender, text) {
     const chatBox = document.getElementById('chat-box');
     if (!chatBox) return;
     const msgDiv = document.createElement('div');
-    msgDiv.classList.add('chat-message');
-    msgDiv.classList.add(sender === 'user' ? 'msg-user' : 'msg-ai');
+    msgDiv.classList.add('chat-message', sender === 'user' ? 'msg-user' : 'msg-ai');
     msgDiv.innerText = text;
     chatBox.appendChild(msgDiv);
     chatBox.scrollTop = chatBox.scrollHeight;
-    chatHistory.push({ role: sender === 'user' ? 'user' : 'model', parts: [{ text: text }] });
+    chatHistory.push({ role: sender === 'user' ? 'user' : 'model', parts: [{ text }] });
 }
 
-// Anti-echo wrapper to prevent ECA's voice from being captured
+// FIX: flush del buffer STT dopo ECA speech per eliminare l'eco accumulato
 async function speakECA(text) {
     ignoreMicUntil = Infinity;
+    micBlockReason = 'echo';
+    updateMicStatusUI();
     try {
         await eca.speak(text);
     } catch (e) {
         console.error("TTS Error:", e);
     } finally {
+        // Svuota il buffer audio del motore STT prima di riaprire il gate
+        if (voiceInput) voiceInput.flush();
         ignoreMicUntil = performance.now() + 1500;
+        // micBlockReason viene resettato nel prossimo aggiornamento UI
+        // (dopo che ignoreMicUntil scade, il prossimo frame di stato lo corregge)
     }
 }
+
+// Aggiorna la label di stato microfono in base al motivo del blocco
+function updateMicStatusUI() {
+    const el = document.getElementById('voice-status');
+    if (!el) return;
+
+    const now = performance.now();
+    if (now < ignoreMicUntil) {
+        el.innerText = "Anti-eco attivo...";
+        el.style.color = '#f59e0b';
+    } else if (!isPdfLoaded) {
+        el.innerText = "Carica un PDF per attivare";
+        el.style.color = '#94a3b8';
+    } else if (affectAnalyzer.isCalibrating) {
+        el.innerText = "Calibrazione in corso...";
+        el.style.color = '#94a3b8';
+    } else if (isAnsweringUser) {
+        el.innerText = "Elaborazione risposta...";
+        el.style.color = '#3b82f6';
+    } else if (isProactiveInterventionActive) {
+        el.innerText = "Intervento Aura...";
+        el.style.color = '#8b5cf6';
+    } else {
+        el.innerText = "In ascolto — di' \"Aura, ...\"";
+        el.style.color = '#10b981';
+    }
+}
+
+function _getFreshGazeContext() {
+    if (!isPdfLoaded) return "";
+    return (performance.now() - lastGazedTextTimestamp) > GAZE_CONTEXT_TTL_MS
+        ? "" : currentGazedText.trim();
+}
+
+function _snippetChangedSignificantly(a, b) {
+    if (!b) return true;
+    const wA = new Set(a.toLowerCase().split(/\s+/));
+    const wB = new Set(b.toLowerCase().split(/\s+/));
+    let overlap = 0;
+    for (const w of wA) { if (wB.has(w)) overlap++; }
+    return (overlap / Math.max(wA.size, wB.size)) < 0.7;
+}
+
+function median(arr) {
+    const s = [...arr].sort((a, b) => a - b);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
 
 async function init() {
     const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm"
     );
-
     faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
         baseOptions: {
             modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
@@ -101,294 +164,318 @@ async function init() {
         gazeDot.style.display = 'block';
     });
 
-    // Microphone management
-    voiceInput = new VoiceInput((interim, final) => {
+    voiceInput = new VoiceInput(
+        // onTranscript
+        (interim, final) => {
+            // ── Gate: ordine di priorità ────────────────────────────────
+            // 1. Anti-echo sempre prioritario
+            if (performance.now() < ignoreMicUntil) return;
 
-        // If PDF is not loaded, the assistant ignores everything
-        if (!isPdfLoaded || performance.now() < ignoreMicUntil || isAnsweringUser || isProactiveInterventionActive) {
-            return;
-        }
+            // 2. Calibrazione emotiva: ignora tutto
+            if (affectAnalyzer.isCalibrating) return;
 
-        const voiceDiv = document.getElementById('val-voice');
+            // 3. PDF non caricato
+            if (!isPdfLoaded) return;
 
-        // If conditions are met, set assistant to listening
-        if ((interim || final) && eca.currentState === 'IDLE') {
-            eca.setState('LISTENING');
-        }
+            // 4. ECA sta rispondendo a una domanda dell'utente: ignora
+            if (isAnsweringUser) return;
 
-        // Cleanup any timeouts
-        if (userMicTimeout) clearTimeout(userMicTimeout);
-
-        if (final) {
-            currentFinalTranscript = final.trim();
-            voiceDiv.innerHTML = `<span style="color: #0f172a; font-weight: 600;">${final}</span>`;
-            console.log(`[USER]: "${currentFinalTranscript}"`);
-
-            const textLower = currentFinalTranscript.toLowerCase();
-            const isWakeWordSpoken = textLower.startsWith("aura") || textLower.includes("aura");
-
-            if (currentFinalTranscript.length > 5 && isWakeWordSpoken) {
-                // User asked a question
-                manageUserQuestion(currentFinalTranscript);
-            } else {
-                // False alarm
-                eca.setState('IDLE');
+            // 5. Intervento proattivo: SOLO wake word può interrompere
+            //    (l'utente può dire "Aura, ho capito" per fermare l'intervento)
+            if (isProactiveInterventionActive) {
+                if (final) {
+                    const lower = final.trim().toLowerCase();
+                    if (WAKE_WORD_RE.test(lower) && final.trim().length > 5) {
+                        // Interrompe l'intervento e gestisce la domanda
+                        eca.currentAudio.pause();
+                        isProactiveInterventionActive = false;
+                        negativeStateStartTime = 0;
+                        manageUserQuestion(final.trim());
+                    }
+                }
+                return;
             }
 
-            setTimeout(() => { if (currentFinalTranscript === final.trim()) currentFinalTranscript = ""; }, 3000);
+            // ── Tutti i gate superati ────────────────────────────────────
+            updateMicStatusUI();
+            const voiceDiv = document.getElementById('val-voice');
 
-        } else if (interim) {
-            voiceDiv.innerHTML = `<span style="font-style: italic;">${interim}...</span>`;
+            if ((interim || final) && eca.currentState === 'IDLE') eca.setState('LISTENING');
+            if (userMicTimeout) clearTimeout(userMicTimeout);
 
-            // Security timer: if no new word or final confirmation arrives within 1.5s,
-            // it means the user stopped speaking without generating a valid sentence. Return to IDLE.
-            userMicTimeout = setTimeout(() => {
-                if (eca.currentState === 'LISTENING') {
+            if (final) {
+                const text  = final.trim();
+                const lower = text.toLowerCase();
+                currentFinalTranscript = text;
+                voiceDiv.innerHTML = `<span style="color:#0f172a;font-weight:600;">${text}</span>`;
+
+                // FIX wake word: word boundary regex, non substring
+                if (text.length > 5 && WAKE_WORD_RE.test(lower)) {
+                    manageUserQuestion(text);
+                } else {
                     eca.setState('IDLE');
+                    // Feedback: l'utente ha parlato ma senza wake word
+                    if (text.length > 3) {
+                        voiceDiv.innerHTML += `<span style="font-size:0.75rem;color:#94a3b8;display:block;">
+                            (Di' "Aura" per attivare l'assistente)</span>`;
+                    }
                 }
-            }, 1500);
-        }
-    }, (statusMessage) => {
-        document.getElementById('voice-status').innerText = statusMessage;
-    });
 
-    try {
-        await eca.loadModel('./models/personaggio.fbx');
-        console.log("3D Model loaded successfully!");
-    } catch (error) {
-        console.error("Error loading 3D model:", error);
-    }
+                setTimeout(() => { if (currentFinalTranscript === text) currentFinalTranscript = ""; }, 3000);
+
+            } else if (interim) {
+                voiceDiv.innerHTML = `<span style="font-style:italic;color:#475569;">${interim}...</span>`;
+                userMicTimeout = setTimeout(() => {
+                    if (eca.currentState === 'LISTENING') eca.setState('IDLE');
+                }, 1500);
+            }
+        },
+        // onStatusChange
+        (statusMessage) => {
+            // VoiceInput manda solo errori critici (mic negato ecc.)
+            // Lo stato normale è gestito da updateMicStatusUI()
+            if (statusMessage.startsWith("Errore")) {
+                const el = document.getElementById('voice-status');
+                if (el) { el.innerText = statusMessage; el.style.color = '#ef4444'; }
+            }
+        }
+    );
+
+    try { await eca.loadModel('./models/personaggio.fbx'); }
+    catch (error) { console.error("Error loading 3D model:", error); }
 
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
     video.srcObject = stream;
     video.addEventListener('loadeddata', loop);
 
-    // --- RECOVERY GAZE CALIBRATION IN RAM ---
-    if (gazeCalibrator.loadFromStorage && gazeCalibrator.loadFromStorage()) {
-        console.log("[AURA] Gaze calibration successfully recovered from session.");
-        gazeDot.style.display = 'block';
-    } else {
-        console.log("[AURA] No previous calibration found in this session.");
-    }
+    if (gazeCalibrator.loadFromStorage?.()) gazeDot.style.display = 'block';
+
+    // Aggiorna la label mic ogni secondo (per far scadere lo stato anti-echo)
+    setInterval(updateMicStatusUI, 1000);
 }
 
+// ── LLM ───────────────────────────────────────────────────────────────────
+
 async function fetchLLMResponse(userText) {
-    const url = "http://localhost:8000/api/chat";
-    
-    // Secure payload preparation
     const payload = {
         user_text: userText,
         emotion_state: currentEmotionState,
-        slide_context: (isPdfLoaded && documentContextText !== "") ? documentContextText : ""
+        slide_context: _getFreshGazeContext()
     };
-
     try {
-        const response = await fetch(url, {
+        const res = await fetch("http://localhost:8000/api/chat", {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        
-        if (!response.ok) throw new Error("Network error with Proxy");
-        const data = await response.json();
-        
-        return data.text;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return (await res.json()).text;
     } catch (e) {
-        console.error(e);
-        return "Connection error with central system.";
+        console.error("[LLM]", e);
+        return "Errore di connessione con il sistema centrale.";
     }
 }
 
-// LLM CONVERSATIONAL FLOW
 async function manageUserQuestion(questionText) {
-    if (isAnsweringUser || isProactiveInterventionActive) return;
-
+    if (isAnsweringUser) return;
     isAnsweringUser = true;
-
     addChatMessage('user', questionText);
-    // Responds to acknowledge
     await speakECA("Certo, dammi un secondo.");
-
-    // NOW enters THINKING while simulating LLM search
-    console.log("[AURA] Thinking about the response...");
     eca.setState('THINKING');
-
-    const llmResponseText = await fetchLLMResponse(questionText);
-    addChatMessage('ai', llmResponseText);
-    await speakECA(llmResponseText);
-
+    const reply = await fetchLLMResponse(questionText);
+    addChatMessage('ai', reply);
+    await speakECA(reply);
     lastProactiveIntervention = performance.now();
     isAnsweringUser = false;
     eca.setState('IDLE');
+    updateMicStatusUI();
 }
+
+// ── Render loop ────────────────────────────────────────────────────────────
 
 function drawFaceMeshSegments(landmarks) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const drawPath = (indices, color, closePath = false) => {
-        ctx.beginPath();
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.5;
-        for (let i = 0; i < indices.length; i++) {
-            const pt = landmarks[indices[i]];
-            const x = pt.x * canvas.width;
-            const y = pt.y * canvas.height;
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-        }
-        if (closePath) ctx.closePath();
+    const drawPath = (indices, color, close = false) => {
+        ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+        indices.forEach((idx, i) => {
+            const pt = landmarks[idx];
+            if (i === 0) ctx.moveTo(pt.x * canvas.width, pt.y * canvas.height);
+            else         ctx.lineTo(pt.x * canvas.width, pt.y * canvas.height);
+        });
+        if (close) ctx.closePath();
         ctx.stroke();
     };
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows,     'rgba(43,87,151,0.8)');
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye,   'rgba(0,180,0,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye,  'rgba(0,180,0,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.outerLips, 'rgba(185,29,71,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.innerLips, 'rgba(185,29,71,0.8)', true);
+}
 
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows, 'rgba(43, 87, 151, 0.8)');
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye, 'rgba(0, 180, 0, 0.8)', true);
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye, 'rgba(0, 180, 0, 0.8)', true);
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.outerLips, 'rgba(185, 29, 71, 0.8)', true);
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.innerLips, 'rgba(185, 29, 71, 0.8)', true);
+function updateStatusCard(state) {
+    const card = document.getElementById('card-status');
+    const val  = document.getElementById('val-status');
+    card.classList.remove('alert', 'warning', 'info');
+    if      (state.isFrustrated) { card.classList.add('alert');   val.innerText = "Frustrato"; }
+    else if (state.isConfused)   { card.classList.add('warning'); val.innerText = "Confuso"; }
+    else if (state.isBored)      { card.classList.add('info');    val.innerText = "Annoiato"; }
+    else                         {                                val.innerText = "Normale"; }
 }
 
 async function loop() {
     const ts = performance.now();
 
     if (video.currentTime !== lastVideoTime) {
-        const dtSec = (ts - lastFrameTimeMs) / 1000.0;
+        const dtSec = Math.min((ts - lastFrameTimeMs) / 1000.0, 0.1);
         lastFrameTimeMs = ts;
-        lastVideoTime = video.currentTime;
+        lastVideoTime   = video.currentTime;
 
-        const dtSecClamped = Math.min(dtSec, 0.1);
-
-        eca.update(dtSecClamped);
-
-        canvas.width = video.videoWidth;
+        eca.update(dtSec);
+        canvas.width  = video.videoWidth;
         canvas.height = video.videoHeight;
 
         const results = faceLandmarker.detectForVideo(video, ts);
 
-        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-            const landmarks = results.faceLandmarks[0];
+        if (results.faceLandmarks?.length > 0) {
+            const landmarks  = results.faceLandmarks[0];
             drawFaceMeshSegments(landmarks);
 
             const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
-            if (!rawMetrics) {
-                requestAnimationFrame(loop);
-                return;
-            }
+            if (!rawMetrics) { requestAnimationFrame(loop); return; }
 
             currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
 
-            if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
-                const depthScale = 0.20 / rawMetrics.iod;
-                const depthCorrectedX = currentNormalizedIris.x * depthScale;
-                const depthCorrectedY = currentNormalizedIris.y * depthScale;
-
-                const rawPos = gazeCalibrator.predict(depthCorrectedX, depthCorrectedY);
-
-                if (rawPos) {
-                    const smoothPos = uiFilter.filter(rawPos.x, rawPos.y, ts);
-                    currentSmoothPos = smoothPos;
-
-                    gazeDot.style.left = `${smoothPos.x}px`;
-                    gazeDot.style.top = `${smoothPos.y}px`;
-                    document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
+            // Multi-frame calibration
+            if (isCollectingGazeSample && currentNormalizedIris) {
+                gazeSampleBuffer.push({ x: currentNormalizedIris.x, y: currentNormalizedIris.y });
+                calibrationUI.updateProgress(Math.min(gazeSampleBuffer.length / GAZE_SAMPLE_COUNT, 1));
+                if (gazeSampleBuffer.length >= GAZE_SAMPLE_COUNT) {
+                    const medX = median(gazeSampleBuffer.map(p => p.x));
+                    const medY = median(gazeSampleBuffer.map(p => p.y));
+                    const target = calibrationUI.getNextPointCoords();
+                    gazeCalibrator.recordDataPoint(medX, medY, target.x, target.y);
+                    calibrationUI.advance();
+                    gazeSampleBuffer = [];
+                    isCollectingGazeSample = false;
                 }
             }
 
+            // Gaze prediction
+            if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
+                const baseIod = affectAnalyzer.baseline?.iod > 0 ? affectAnalyzer.baseline.iod : 0.20;
+                const rawPos  = gazeCalibrator.predict(
+                    currentNormalizedIris.x * (baseIod / rawMetrics.iod),
+                    currentNormalizedIris.y * (baseIod / rawMetrics.iod)
+                );
+                if (rawPos) {
+                    const smooth = uiFilter.filter(rawPos.x, rawPos.y, ts);
+                    currentSmoothPos = smooth;
+                    gazeDot.style.left    = `${smooth.x}px`;
+                    gazeDot.style.top     = `${smooth.y}px`;
+                    if (rawPos.confidence !== undefined)
+                        gazeDot.style.opacity = (0.4 + 0.6 * rawPos.confidence).toFixed(2);
+                    document.getElementById('val-gaze').innerText =
+                        `X: ${Math.round(smooth.x)}, Y: ${Math.round(smooth.y)}`;
+                }
+            }
+
+            // Emotion calibration
             if (affectAnalyzer.isCalibrating) {
                 const done = affectAnalyzer.processCalibrationSample(rawMetrics);
                 if (done) {
                     calOverlay.style.display = 'none';
-                    document.getElementById('val-status').innerText = "Calibrazione completata. Rilevamento attivo.";
-                    console.log("Emotional calibration completed!");
-
+                    document.getElementById('val-status').innerText = "Calibrazione completata.";
+                    updateMicStatusUI();
                     setTimeout(async () => {
                         isProactiveInterventionActive = true;
                         try {
-                            const greetingMessage = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
-                            addChatMessage('ai', greetingMessage);
-                            await speakECA(greetingMessage);
+                            const msg = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
+                            addChatMessage('ai', msg);
+                            await speakECA(msg);
                         } finally {
                             isProactiveInterventionActive = false;
-                            console.log("[AURA] Presentation concluded, listening.");
+                            updateMicStatusUI();
                         }
                     }, 1000);
                 }
+
             } else if (affectAnalyzer.isCalibrated) {
-                const state = affectAnalyzer.update(rawMetrics, dtSecClamped);
+                const state = affectAnalyzer.update(rawMetrics, dtSec);
 
-                if (ts - lastLogTs > 1000) {
-                    lastLogTs = ts;
-                }
-
-                // Update emotional state for LLM
-                if (state.isFrustrated) currentEmotionState = "Molto Frustrato";
-                else if (state.isConfused) currentEmotionState = "Confuso";
-                else currentEmotionState = "Attento";
+                if      (state.isFrustrated) currentEmotionState = "Frustrato";
+                else if (state.isConfused)   currentEmotionState = "Confuso";
+                else if (state.isBored)      currentEmotionState = "Annoiato";
+                else                         currentEmotionState = "Normale";
 
                 document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                 document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
 
-                const asymEl = document.getElementById('val-asym');
-                if (asymEl) asymEl.innerText = `${rawMetrics.browAsymmetry.toFixed(3)}`;
+                if (!isProactiveInterventionActive && !isAnsweringUser) updateStatusCard(state);
 
-                const cardStatus = document.getElementById('card-status');
-                cardStatus.classList.remove('alert', 'warning', 'info');
-
-                if (!isProactiveInterventionActive && !isAnsweringUser) {
-                    if (state.isSpeaking) {
-                        cardStatus.classList.add('info');
-                        document.getElementById('val-status').innerText = "VAD: Movimento Labiale...";
-                    } else if (state.isFrustrated) {
-                        cardStatus.classList.add('alert');
-                        document.getElementById('val-status').innerText = `SOVRACCARICO (${state.stressPercentage.toFixed(0)}%)`;
-                    } else if (state.isConfused) {
-                        cardStatus.classList.add('warning');
-                        document.getElementById('val-status').innerText = `CONFUSIONE RILEVATA`;
-                    } else if (state.isBored) {
-                        cardStatus.classList.add('info');
-                        document.getElementById('val-status').innerText = `NOIA (${state.boredomPercentage.toFixed(0)}%)`;
-                    } else {
-                        document.getElementById('val-status').innerText = `Attivo e Regolare (${state.stressPercentage.toFixed(0)}%)`;
-                    }
+                // Negative state persistence timer
+                const isNegativeNow = state.isFrustrated || state.isConfused || state.isBored;
+                if (!isNegativeNow) {
+                    negativeStateStartTime = 0;
+                } else if (negativeStateStartTime === 0 && !isProactiveInterventionActive && !isAnsweringUser) {
+                    negativeStateStartTime = ts;
                 }
 
-                const timeSinceLastIntervention = ts - lastProactiveIntervention;
-                const isCooldownPassed = timeSinceLastIntervention > PROACTIVE_COOLDOWN_MS;
-                const canInterveneTime = !firstInterventionDone || isCooldownPassed;
+                const negativeMs   = negativeStateStartTime > 0 ? ts - negativeStateStartTime : 0;
+                const isPersistent = negativeMs >= NEGATIVE_STATE_PERSIST_MS;
+                const canIntervene = !firstInterventionDone || (ts - lastProactiveIntervention) > PROACTIVE_COOLDOWN_MS;
 
-                if (isPdfLoaded && (state.isFrustrated || state.isConfused) && canInterveneTime && !isProactiveInterventionActive && !isAnsweringUser) {
-                    console.log(`[AURA] Intervention TRIGGERED! Generating intelligent response...`);
+                if (isPdfLoaded && isPersistent && canIntervene && !isProactiveInterventionActive && !isAnsweringUser) {
+                    console.log(`[AURA] Intervento dopo ${(negativeMs/1000).toFixed(1)}s: ${currentEmotionState}`);
                     isProactiveInterventionActive = true;
                     firstInterventionDone = true;
                     lastProactiveIntervention = ts;
-                    
+                    negativeStateStartTime = 0;
                     eca.setState('THINKING');
 
-                    const hiddenPrompt = state.isConfused
-                        ? "L'utente mostra confusione guardando l'attuale slide. Formula una brevissima domanda (massimo 15 parole) proponendo di rispiegare un termine tecnico specifico presente nel testo."
-                        : "L'utente mostra segni di frustrazione o sovraccarico cognitivo. Fagli una brevissima proposta empatica (massimo 15 parole) citando l'argomento della slide per aiutarlo a sbloccarsi.";
+                    const gazeCtx = _getFreshGazeContext();
+                    let prompt;
+                    if (gazeCtx.length <= 5) {
+                        prompt = "L'utente sembra in difficoltà ma non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.";
+                    } else if (state.isConfused) {
+                        prompt = "L'utente mostra confusione guardando l'attuale slide. Formula una brevissima domanda (massimo 15 parole) proponendo di rispiegare un termine tecnico specifico presente nel testo.";
+                    } else if (state.isFrustrated) {
+                        prompt = "L'utente mostra segni di frustrazione. Fagli una brevissima proposta empatica (massimo 15 parole) citando l'argomento della slide per aiutarlo a sbloccarsi.";
+                    } else {
+                        prompt = "L'utente sembra annoiato. Fagli una breve domanda di coinvolgimento (massimo 15 parole) sull'argomento che stava leggendo.";
+                    }
 
-                    fetchLLMResponse(hiddenPrompt).then(interventionPhrase => {
-                        addChatMessage('ai', interventionPhrase);
-                        speakECA(interventionPhrase).then(() => {
-                            console.log("[AURA] Intervention concluded.");
+                    fetchLLMResponse(prompt).then(phrase => {
+                        addChatMessage('ai', phrase);
+                        speakECA(phrase).then(() => {
                             isProactiveInterventionActive = false;
+                            negativeStateStartTime = 0;
+                            updateMicStatusUI();
                         });
                     });
                 }
 
                 if (gazeCalibrator.regressionModel) {
                     sessionData.push({
-                        timestamp: ts.toFixed(2),
-                        dtSec: dtSecClamped.toFixed(4),
+                        timestamp: ts.toFixed(2), dtSec: dtSec.toFixed(4),
+                        rawGazeX: currentNormalizedIris?.x.toFixed(5) ?? "0",
+                        rawGazeY: currentNormalizedIris?.y.toFixed(5) ?? "0",
                         smoothGazeX: currentSmoothPos.x.toFixed(2),
                         smoothGazeY: currentSmoothPos.y.toFixed(2),
-                        zAU4: state.zCorrugator.toFixed(2),
-                        zEar: state.zEar.toFixed(2),
+                        iod: rawMetrics.iod.toFixed(4),
+                        zAU4: state.zCorrugator.toFixed(2), zEar: state.zEar.toFixed(2),
+                        zLip: state.zLip.toFixed(2), zAU1: state.zInnerBrowRaise.toFixed(2),
+                        zAU9: state.zNoseWrinkle.toFixed(2),
+                        blinkRate: state.blinkRate.toFixed(3),
+                        confusionScore: state.confusionScore,
                         stressPercentage: state.stressPercentage.toFixed(2),
                         boredomPercentage: state.boredomPercentage.toFixed(2),
+                        stressDelta: (state.stressPercentage > 0 ? 1 : 0),
                         isFrustrated: state.isFrustrated ? 1 : 0,
                         isBored: state.isBored ? 1 : 0,
                         isConfused: state.isConfused ? 1 : 0,
                         isSpeaking: state.isSpeaking ? 1 : 0,
+                        gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
+                        emotionState: currentEmotionState,
                         spokenText: currentFinalTranscript
                     });
                 }
@@ -398,272 +485,244 @@ async function loop() {
     requestAnimationFrame(loop);
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-    video = document.getElementById('webcam');
-    canvas = document.getElementById('output-canvas');
-    ctx = canvas.getContext('2d');
-    gazeDot = document.getElementById('gaze-dot');
+// ── DOMContentLoaded ───────────────────────────────────────────────────────
 
-    btnCalGaze = document.getElementById('btn-cal-gaze');
+document.addEventListener("DOMContentLoaded", () => {
+    video         = document.getElementById('webcam');
+    canvas        = document.getElementById('output-canvas');
+    ctx           = canvas.getContext('2d');
+    gazeDot       = document.getElementById('gaze-dot');
+    btnCalGaze    = document.getElementById('btn-cal-gaze');
     btnCalEmotion = document.getElementById('btn-cal-emotion');
-    calOverlay = document.getElementById('cal-overlay');
+    calOverlay    = document.getElementById('cal-overlay');
 
     btnCalGaze.onclick = () => {
         btnCalGaze.blur();
-        gazeCalibrator.reset();
-        uiFilter.reset();
+        gazeCalibrator.reset(); uiFilter.reset();
         isGazeCalibrating = true;
+        isCollectingGazeSample = false; gazeSampleBuffer = [];
         calibrationUI.start();
     };
 
     btnCalEmotion.onclick = () => {
         btnCalEmotion.blur();
-
-        if (voiceInput && !voiceInput.isListening) {
-            voiceInput.start();
-        }
-
+        if (voiceInput && !voiceInput.isListening) voiceInput.start();
         eca.currentAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-        eca.currentAudio.play().catch(() => { });
-
+        eca.currentAudio.play().catch(() => {});
         calOverlay.style.display = 'block';
         document.getElementById('val-status').innerText = "Acquisizione Baseline...";
         affectAnalyzer.startCalibration();
-        console.log("Emotional calibration started...");
+        updateMicStatusUI();
     };
 
-    // --- SPACEBAR: records gaze calibration point ---
     window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space' && isGazeCalibrating) {
-            e.preventDefault();
-            if (!e.repeat && currentNormalizedIris) {
-                const target = calibrationUI.getNextPointCoords();
-                gazeCalibrator.recordDataPoint(
-                    currentNormalizedIris.x, currentNormalizedIris.y,
-                    target.x, target.y
-                );
-                calibrationUI.advance();
-            }
+        if (e.code !== 'Space' || !isGazeCalibrating) return;
+        e.preventDefault();
+        if (e.repeat) return;
+
+        // Fase intro: SPAZIO avvia la calibrazione vera
+        if (calibrationUI._phase === 'intro') {
+            calibrationUI.onSpaceDown();
+            return;
+        }
+
+        // Fase dots: avvia raccolta multi-frame
+        if (!isCollectingGazeSample && currentNormalizedIris) {
+            isCollectingGazeSample = true; gazeSampleBuffer = [];
+            calibrationUI.updateProgress(0);
         }
     });
 
-    const btnExport = document.getElementById('btn-export');
-    if (btnExport) {
-        btnExport.onclick = () => {
-            btnExport.blur();
-            if (sessionData.length === 0) {
-                alert("Nessun dato registrato.");
-                return;
-            }
-            const headers = Object.keys(sessionData[0]).join(",");
-            const rows = sessionData.map(row => {
-                if (row.spokenText) row.spokenText = row.spokenText.replace(/,/g, ';');
-                return Object.values(row).join(",");
-            }).join("\n");
+    window.addEventListener('keyup', (e) => {
+        if (e.code !== 'Space' || !isGazeCalibrating) return;
+        if (isCollectingGazeSample && gazeSampleBuffer.length < GAZE_SAMPLE_COUNT) {
+            isCollectingGazeSample = false; gazeSampleBuffer = [];
+            calibrationUI.updateProgress(0);
+        }
+    });
 
-            const csvContent = "data:text/csv;charset=utf-8," + headers + "\n" + rows;
-            const encodedUri = encodeURI(csvContent);
-            const link = document.createElement("a");
-            link.setAttribute("href", encodedUri);
-            link.setAttribute("download", "aura_test_data.csv");
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        };
-    }
+    window.addEventListener('resize', () => {
+        currentGazedText = ""; lastGazedTextTimestamp = 0; _lastExtractedSnippet = "";
+    });
 
-    // --- PDF / Webcam View Buttons ---
-    const btnShowPdf = document.getElementById('btn-show-pdf');
-    const btnShowCam = document.getElementById('btn-show-cam');
+    document.getElementById('btn-export')?.addEventListener('click', () => {
+        if (sessionData.length === 0) { alert("Nessun dato registrato."); return; }
+        const headers = Object.keys(sessionData[0]).join(",");
+        const rows = sessionData.map(r => {
+            if (r.spokenText) r.spokenText = r.spokenText.replace(/,/g, ';');
+            return Object.values(r).join(",");
+        }).join("\n");
+        const link = document.createElement("a");
+        link.href = "data:text/csv;charset=utf-8," + encodeURI(headers + "\n" + rows);
+        link.download = "aura_test_data.csv";
+        document.body.appendChild(link); link.click(); document.body.removeChild(link);
+    });
 
-    if (btnShowPdf) {
-        btnShowPdf.onclick = () => {
-            document.getElementById('video-wrapper').style.display = 'none';
-            document.getElementById('pdf-wrapper').style.display = 'block';
-            btnShowPdf.style.display = 'none';
-            btnShowCam.style.display = 'inline-block';
-            document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'none');
-            const chatContainer = document.getElementById('chat-container');
-            if (chatContainer) chatContainer.style.display = 'flex';
-        };
-    }
+    document.getElementById('btn-show-pdf')?.addEventListener('click', () => {
+        document.getElementById('video-wrapper').style.display = 'none';
+        document.getElementById('pdf-wrapper').style.display = 'block';
+        document.getElementById('btn-show-pdf').style.display = 'none';
+        document.getElementById('btn-show-cam').style.display = 'inline-block';
+        document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'none');
+        const cc = document.getElementById('chat-container');
+        if (cc) cc.style.display = 'flex';
+        updateMicStatusUI();
+    });
 
-    if (btnShowCam) {
-        btnShowCam.onclick = () => {
-            document.getElementById('pdf-wrapper').style.display = 'none';
-            document.getElementById('video-wrapper').style.display = 'block';
-            btnShowCam.style.display = 'none';
-            btnShowPdf.style.display = 'inline-block';
-            document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'block');
-            const chatContainer = document.getElementById('chat-container');
-            if (chatContainer) chatContainer.style.display = 'none';
-        };
-    }
+    document.getElementById('btn-show-cam')?.addEventListener('click', () => {
+        document.getElementById('pdf-wrapper').style.display = 'none';
+        document.getElementById('video-wrapper').style.display = 'block';
+        document.getElementById('btn-show-cam').style.display = 'none';
+        document.getElementById('btn-show-pdf').style.display = 'inline-block';
+        document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'block');
+        const cc = document.getElementById('chat-container');
+        if (cc) cc.style.display = 'none';
+    });
 
-    const dropZone = document.getElementById('pdf-drop-zone');
-    const inputPdf = document.getElementById('input-pdf');
+    const dropZone        = document.getElementById('pdf-drop-zone');
+    const inputPdf        = document.getElementById('input-pdf');
     const slidesContainer = document.getElementById('slides-container');
-    const pdfSpinner = document.getElementById('pdf-loading-spinner');
+    const pdfSpinner      = document.getElementById('pdf-loading-spinner');
 
     if (dropZone && inputPdf && slidesContainer) {
-        dropZone.onclick = () => inputPdf.click();
+        dropZone.onclick    = () => inputPdf.click();
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('dragover'); };
-        dropZone.ondrop = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
-        inputPdf.onchange = (e) => handlePdfUpload(e.target.files[0]);
+        dropZone.ondrop     = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
+        inputPdf.onchange   = (e) => handlePdfUpload(e.target.files[0]);
     }
 
-    function handlePdfUpload(file) {
+    async function handlePdfUpload(file) {
         if (!file || file.type !== "application/pdf") return alert("Carica un PDF.");
 
         const pdfjsLib = window['pdfjs-dist/build/pdf'];
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-        if (dropZone) dropZone.style.display = 'none';
+        if (textExtractionInterval) { clearInterval(textExtractionInterval); textExtractionInterval = null; }
+        isPdfLoaded = false;
+        currentGazedText = ""; lastGazedTextTimestamp = 0; _lastExtractedSnippet = "";
+
+        if (dropZone)        dropZone.style.display = 'none';
         if (slidesContainer) slidesContainer.style.display = 'none';
-        if (pdfSpinner) pdfSpinner.style.display = 'block';
+        if (pdfSpinner)      pdfSpinner.style.display = 'block';
 
         const auraPromise = speakECA("Sto analizzando le slide, preparo il livello semantico.");
 
         const fileReader = new FileReader();
+        fileReader.onerror = () => {
+            if (pdfSpinner) pdfSpinner.style.display = 'none';
+            alert("Errore nella lettura del file.");
+        };
+
         fileReader.onload = async function () {
             try {
-                const pdf = await pdfjsLib.getDocument(new Uint8Array(this.result)).promise;
+                let pdf;
+                try {
+                    pdf = await pdfjsLib.getDocument(new Uint8Array(this.result)).promise;
+                } catch (e) { throw new Error(`PDF non valido: ${e.message}`); }
+
                 slidesContainer.innerHTML = '';
                 slidesContainer.style.display = 'block';
-                
-                // Resetta il contesto precedente
-                documentContextText = "";
+                let totalTextItems = 0;
 
                 for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-                    const page = await pdf.getPage(pageNum);
+                    const page     = await pdf.getPage(pageNum);
                     const viewport = page.getViewport({ scale: 1.5 });
 
-                    // Creazione del wrapper per Canvas + TextLayer
                     const pageWrapper = document.createElement('div');
-                    pageWrapper.style.position = 'relative';
-                    pageWrapper.style.margin = '0 auto 30px auto';
-                    pageWrapper.style.width = `${viewport.width}px`;
-                    pageWrapper.style.height = `${viewport.height}px`;
+                    pageWrapper.style.cssText = `position:relative;margin:0 auto 30px auto;width:${viewport.width}px;height:${viewport.height}px;`;
                     pageWrapper.className = 'pdf-slide-wrapper';
-                    
+                    pageWrapper.dataset.pageNum = pageNum;
+
                     const slideCanvas = document.createElement('canvas');
                     slideCanvas.className = 'pdf-slide-canvas';
-                    slideCanvas.height = viewport.height;
-                    slideCanvas.width = viewport.width;
+                    slideCanvas.height = viewport.height; slideCanvas.width = viewport.width;
                     slideCanvas.style.display = 'block';
-                    
                     pageWrapper.appendChild(slideCanvas);
                     slidesContainer.appendChild(pageWrapper);
-                    
-                    const renderTask = page.render({ canvasContext: slideCanvas.getContext('2d'), viewport: viewport }).promise;
-                    
-                    // 2. Creazione del TEXT LAYER invisibile per l'Hit Testing
-                    const textContent = await page.getTextContent();
-                    
+
+                    const [textContent] = await Promise.all([
+                        page.getTextContent(),
+                        page.render({ canvasContext: slideCanvas.getContext('2d'), viewport }).promise
+                    ]);
+
+                    totalTextItems += textContent.items.length;
+
+                    if (textContent.items.length === 0) {
+                        const badge = document.createElement('div');
+                        badge.style.cssText = 'position:absolute;top:8px;left:8px;background:rgba(245,158,11,0.85);color:white;padding:3px 8px;border-radius:4px;font-size:0.75rem;font-family:system-ui,sans-serif;pointer-events:none;z-index:5;';
+                        badge.innerText = `Pagina ${pageNum}: solo immagine`;
+                        pageWrapper.appendChild(badge);
+                        continue;
+                    }
+
                     const textLayerDiv = document.createElement('div');
                     textLayerDiv.className = 'textLayer';
-                    textLayerDiv.style.position = 'absolute';
-                    textLayerDiv.style.left = '0';
-                    textLayerDiv.style.top = '0';
-                    textLayerDiv.style.right = '0';
-                    textLayerDiv.style.bottom = '0';
-                    textLayerDiv.style.overflow = 'hidden';
-                    textLayerDiv.style.opacity = '0'; // Invisibile ma interattivo
+                    textLayerDiv.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;overflow:hidden;opacity:0;pointer-events:auto;';
                     pageWrapper.appendChild(textLayerDiv);
 
-                    await renderTask;
-
-                    pdfjsLib.renderTextLayer({
-                        textContentSource: textContent,
-                        container: textLayerDiv,
-                        viewport: viewport,
-                        textDivs: []
-                    });
+                    try {
+                        const rt = pdfjsLib.renderTextLayer({ textContentSource: textContent, container: textLayerDiv, viewport, textDivs: [] });
+                        if (rt?.promise) await rt.promise;
+                    } catch (e) { console.warn(`[PDF] textLayer p${pageNum}:`, e.message); }
                 }
 
                 await auraPromise;
-                
                 if (pdfSpinner) pdfSpinner.style.display = 'none';
-                const msg = `Caricamento completato. Ora posso capire esattamente quale frase stai leggendo.`;
+
+                let msg;
+                if (totalTextItems === 0) {
+                    msg = "Attenzione: questo PDF non contiene testo selezionabile. Il rilevamento dello sguardo non potrà estrarre contesto. Considera di usare un PDF con testo incorporato.";
+                } else {
+                    msg = "Caricamento completato. Ora posso capire esattamente quale frase stai leggendo.";
+                }
                 addChatMessage('ai', msg);
                 await speakECA(msg);
-                
+
                 isPdfLoaded = true;
                 lastProactiveIntervention = performance.now();
+                textExtractionInterval = setInterval(extractGazedText, 500);
+                updateMicStatusUI();
 
-                // 3. Avvia il polling per l'Hit Testing semantico (Gaze-Contingency)
-                if (textExtractionInterval) clearInterval(textExtractionInterval);
-                textExtractionInterval = setInterval(extractGazedText, 500); // Controlla cosa guardi ogni 500ms
-                
             } catch (error) {
-                console.error(error);
+                console.error("[PDF]", error);
                 if (pdfSpinner) pdfSpinner.style.display = 'none';
-                alert("Errore critico durante il parsing del PDF.");
+                slidesContainer.style.display = 'none';
+                if (dropZone) dropZone.style.display = 'block';
+                alert(`Errore durante il parsing del PDF:\n${error.message}`);
             }
         };
+
         fileReader.readAsArrayBuffer(file);
     }
 
-    // ── Funzione Gaze-Contingent: Estrae il testo sotto gli occhi ──
     function extractGazedText() {
         if (!isPdfLoaded || isGazeCalibrating) return;
+        if (!gazeCalibrator.regressionModel) return;
+        if (currentSmoothPos.x === 0 && currentSmoothPos.y === 0) return;
 
-        // Disabilita temporaneamente il pointer-events del puntino rosso 
-        // per non intercettare se stesso durante l'elementFromPoint
-        const wasGazeDotPointerEvents = gazeDot.style.pointerEvents;
         gazeDot.style.pointerEvents = 'none';
-
-        // Hit Testing
         const element = document.elementFromPoint(currentSmoothPos.x, currentSmoothPos.y);
-        
-        // Se l'elemento è uno span generato dal TextLayer di PDF.js
-        if (element && element.parentNode && element.parentNode.classList.contains('textLayer')) {
-            // Non prendiamo solo la singola parola, ma unisciamo i testi vicini 
-            // per dare all'LLM una frase sensata (Contesto locale)
-            const siblings = Array.from(element.parentNode.childNodes);
-            const index = siblings.indexOf(element);
-            
-            // Prende le 3 parole prima e le 6 parole dopo per formare un costrutto logico
-            const start = Math.max(0, index - 3);
-            const end = Math.min(siblings.length, index + 6);
-            
-            const contextSnippet = siblings.slice(start, end).map(el => el.textContent).join(' ');
-            
-            if (contextSnippet.trim().length > 5) {
-                currentGazedText = contextSnippet;
-                // Debug opzionale: console.log("Gazed Context:", currentGazedText);
-            }
+        gazeDot.style.pointerEvents = '';
+
+        if (!element) return;
+        if (!element.parentNode?.classList?.contains('textLayer')) return;
+
+        const siblings = Array.from(element.parentNode.children);
+        const index    = siblings.indexOf(element);
+        if (index === -1) return;
+
+        const snippet = siblings
+            .slice(Math.max(0, index - 4), Math.min(siblings.length, index + 8))
+            .map(el => el.textContent.trim()).filter(t => t.length > 0).join(' ');
+
+        if (snippet.trim().length <= 5) return;
+
+        if (_snippetChangedSignificantly(snippet, _lastExtractedSnippet)) {
+            currentGazedText = snippet;
+            _lastExtractedSnippet = snippet;
         }
-
-        gazeDot.style.pointerEvents = wasGazeDotPointerEvents;
-    }
-
-    // Infine, aggiorniamo il payload verso l'LLM (sia proattivo che conversazionale)
-    async function fetchLLMResponse(userText) {
-        const url = "http://localhost:8000/api/chat";
-        
-        // Invia ESATTAMENTE il testo che l'utente sta fissando in quel momento
-        const payload = {
-            user_text: userText,
-            emotion_state: currentEmotionState,
-            slide_context: (isPdfLoaded && currentGazedText !== "") ? currentGazedText : ""
-        };
-
-        try {
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            
-            if (!response.ok) throw new Error("Network error with Proxy");
-            const data = await response.json();
-            
-            return data.text;
-        } catch (e) {
-            console.error(e);
-            return "Connection error with central system.";
-        }
+        lastGazedTextTimestamp = performance.now();
     }
 
     init();
