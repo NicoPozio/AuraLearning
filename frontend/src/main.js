@@ -347,7 +347,9 @@ async function loop() {
 
             // Multi-frame calibration
             if (isCollectingGazeSample && currentNormalizedIris) {
-                gazeSampleBuffer.push({ x: currentNormalizedIris.x, y: currentNormalizedIris.y });
+                // FIX: salva valori depth-corrected, coerenti con predict()
+                const _dcCal = (affectAnalyzer.baseline?.iod > 0 ? affectAnalyzer.baseline.iod : 0.20) / rawMetrics.iod;
+                gazeSampleBuffer.push({ x: currentNormalizedIris.x * _dcCal, y: currentNormalizedIris.y * _dcCal });
                 calibrationUI.updateProgress(Math.min(gazeSampleBuffer.length / GAZE_SAMPLE_COUNT, 1));
                 if (gazeSampleBuffer.length >= GAZE_SAMPLE_COUNT) {
                     const medX = median(gazeSampleBuffer.map(p => p.x));

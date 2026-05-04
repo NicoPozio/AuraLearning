@@ -26,6 +26,7 @@ export class GazeCalibrator {
         this.regressionModel = null; // mantenuto per compatibilità con guard in main.js
         this.normParams = null;
         this._tpsModel = null;
+        this._lastHighConfPos = null;
     }
 
     recordDataPoint(irisX, irisY, screenX, screenY) {
@@ -36,6 +37,7 @@ export class GazeCalibrator {
         this.calibrationPoints = [];
         this.regressionModel = null;
         this._tpsModel = null;
+        this._lastHighConfPos = null;
         this.normParams = null;
         sessionStorage.removeItem('aura_gaze_model');
     }
@@ -66,7 +68,7 @@ export class GazeCalibrator {
 
         // Matrice K (N×N) — kernel TPS φ(r²) = r² · ln(r²)
         // LAMBDA sulla diagonale: regularizzazione per stabilità numerica
-        const LAMBDA = 1e-4;
+        const LAMBDA = 0.05; // aumentato: smoothing estrapol. stabile
         const K = norm.map((pi, i) =>
             norm.map((pj, j) => {
                 if (i === j) return LAMBDA;
@@ -151,13 +153,25 @@ export class GazeCalibrator {
         // Confidence [0,1]: decade esponenzialmente con la distanza dal punto di
         // calibrazione più vicino. Utile per modulare l'opacità del gazeDot
         // (bassa confidence = siamo in zona di estrapolazione).
-        const confidence = Math.exp(-minDist2 / (2 * 0.6 ** 2));
+        const confidence = Math.exp(-minDist2 / (2 * 0.8 ** 2)); // raggio più ampio
 
-        return {
-            x: Math.max(0, Math.min(sx, window.innerWidth)),
-            y: Math.max(0, Math.min(sy, window.innerHeight)),
-            confidence
-        };
+        // Blending: quando siamo in zona di estrapolazione (confidence bassa)
+        // interpola tra la predizione TPS e l'ultima posizione valida ad alta confidence.
+        // Evita i salti casuali ai bordi senza degradare l'accuratezza al centro schermo.
+        const CONF_THRESHOLD = 0.25;
+        const clampedX = Math.max(0, Math.min(sx, window.innerWidth));
+        const clampedY = Math.max(0, Math.min(sy, window.innerHeight));
+
+        let finalX = clampedX, finalY = clampedY;
+        if (confidence < CONF_THRESHOLD && this._lastHighConfPos) {
+            const t = confidence / CONF_THRESHOLD; // 0 = usa lastValid, 1 = usa TPS
+            finalX = t * clampedX + (1 - t) * this._lastHighConfPos.x;
+            finalY = t * clampedY + (1 - t) * this._lastHighConfPos.y;
+        } else if (confidence >= CONF_THRESHOLD) {
+            this._lastHighConfPos = { x: clampedX, y: clampedY };
+        }
+
+        return { x: finalX, y: finalY, confidence };
     }
 
     // ─── Storage ────────────────────────────────────────────────────────────
