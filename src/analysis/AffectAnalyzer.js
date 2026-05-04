@@ -20,6 +20,7 @@ export class AffectAnalyzer {
 
         this.headPoseHistory = [];
         this.lipHistory = [];
+        this.zHistory = { corrugator: [], ear: [], lip: [] };
     }
 
     startCalibration() {
@@ -105,24 +106,31 @@ export class AffectAnalyzer {
             ? Math.min(1.0, metrics.iod / this.baseline.iod)
             : 1.0;
 
-        // Clamping zEar: evita che valori estremi dominino
-        const zEarClamped = Math.min(Math.abs(zEar), 3.0) * Math.sign(zEar);
+        // Media mobile su 6 frame: elimina spike da singoli frame rumorosi
+        const ZWIN = 6;
+        const _pushZ = (buf, v) => { buf.push(v); if (buf.length > ZWIN) buf.shift(); };
+        const _avgZ = buf => buf.reduce((a, b) => a + b, 0) / buf.length;
+        _pushZ(this.zHistory.corrugator, zCorrugator);
+        _pushZ(this.zHistory.ear, zEar);
+        _pushZ(this.zHistory.lip, zLip);
+        const zCorrSmooth = _avgZ(this.zHistory.corrugator);
+        const zEarSmooth = _avgZ(this.zHistory.ear);
+        const zLipSmooth = _avgZ(this.zHistory.lip);
 
-        // Corrugatore: soglia 1.0 (era 1.2) — più reattivo alle sopracciglia aggrottate
-        const actCorr = zCorrugator > 1.0 ? zCorrugator * poseConfidence : 0;
+        // Clamping sull'EAR smoothed per evitare che valori estremi dominino
+        const zEarClamped = Math.min(Math.abs(zEarSmooth), 3.0) * Math.sign(zEarSmooth);
 
-        // EAR: soglia 1.5 (era 1.8) — più reattivo allo strizzare gli occhi
-        const actEar = zEarClamped > 1.5 ? zEarClamped : 0;
+        // Dead-zone: solo l'eccesso sopra soglia contribuisce all'accumulo.
+        // Con la soglia a 1.0σ anche microvariazioni naturali alimentavano l'accumulo;
+        // ora a 1.5σ il segnale deve essere inequivocabile prima di accumulare.
+        const actCorr = zCorrSmooth > 1.5 ? (zCorrSmooth - 1.5) * poseConfidence : 0;
+        const actEar  = zEarClamped  > 2.0 ? (zEarClamped  - 2.0) : 0;
+        const actLip  = zLipSmooth   > 1.8 ? (zLipSmooth   - 1.8) : 0;
 
-        // Lip/sbuffo: soglia abbassata 1.8→1.3 e NON bloccato da isSpeaking
-        // perché lo sbuffo è un movimento labiale breve e deciso
-        const actLip = zLip > 1.3 ? zLip : 0;
-
-        // Pesi: corrugatore dominante, EAR moderato, labbra per sbuffo
         let stressDelta = (actCorr * 2.0) + (actEar * 0.5) + (actLip * 0.8);
 
-        // Confusione: corrugatore > 1.0 + asimmetria > 1.8 (era 2.0)
-        const isConfused = (zCorrugator > 1.0) && (zAsymmetry > 1.8);
+        // Confusione: usa valori smoothed per ridurre falsi positivi
+        const isConfused = (zCorrSmooth > 1.0) && (zAsymmetry > 1.8);
 
         let boredomDelta = 0;
         if (isFaceStatic && zEar > 1.2 && zCorrugator < 0.5) {
@@ -133,17 +141,19 @@ export class AffectAnalyzer {
             this.boredomAccumulator *= 0.5;
         }
 
-        if (this.stressAccumulator < 20 && boredomDelta === 0 && !isSpeaking && !isConfused) {
+        if (this.stressAccumulator < 40 && boredomDelta === 0 && !isSpeaking && !isConfused) {
             const alpha = 0.1 * dtSec;
             this.baseline.corrugator.mean = (1 - alpha) * this.baseline.corrugator.mean + alpha * metrics.corrugator;
             this.baseline.ear.mean = (1 - alpha) * this.baseline.ear.mean + alpha * metrics.ear;
             this.baseline.lipPress.mean = (1 - alpha) * this.baseline.lipPress.mean + alpha * metrics.lipPress;
         }
 
-        // Incremento 16→18, decadimento rimane 30
         const incrementoStress = stressDelta * 18.0 * dtSec;
         const decadimentoStress = 30.0 * dtSec;
-        this.stressAccumulator += (incrementoStress - decadimentoStress);
+        // Scarico attivo: se il viso è chiaramente rilassato si drena più velocemente
+        const isRelaxed = zCorrSmooth < 0.3 && zEarSmooth < 0.5 && zLipSmooth < 0.5;
+        const drainExtra = isRelaxed ? 25.0 * dtSec : 0;
+        this.stressAccumulator += (incrementoStress - decadimentoStress - drainExtra);
         this.stressAccumulator = Math.max(0, Math.min(this.stressAccumulator, this.activationThreshold));
 
         const decadimentoNoia = 10.0 * dtSec;
@@ -164,9 +174,9 @@ export class AffectAnalyzer {
         }
 
         return {
-            zCorrugator,
-            zEar,
-            zLip,
+            zCorrugator: zCorrSmooth,
+            zEar: zEarSmooth,
+            zLip: zLipSmooth,
             isFrustrated: this.currentStateFrustrated,
             isBored: this.currentStateBored,
             isConfused: isConfused,

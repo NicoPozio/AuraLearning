@@ -15,6 +15,10 @@ let sessionData = [];
 let currentSmoothPos = { x: 0, y: 0 };
 let currentFinalTranscript = "";
 
+let pdfTextData = [];
+let currentSlideContext = "";
+let lastGazeContextTs = 0;
+
 let faceLandmarker;
 let lastVideoTime = -1;
 let lastFrameTimeMs = performance.now();
@@ -173,9 +177,13 @@ async function init() {
 async function fetchGeminiResponse(userText) {
     if (!GEMINI_API_KEY) return "Errore API KEY.";
 
+    const slideContextLine = currentSlideContext.trim()
+        ? `L'utente sta guardando questa parte della slide: "${currentSlideContext.trim()}".`
+        : '';
     const systemPrompt = `Sei Aura, un tutor didattico virtuale.
 L'utente sembra: ${currentEmotionState}.
-REGOLE: 1. NON presentarti mai. 2. Vai dritto al sodo. 3. Sii concisa (max 3 frasi). 4. Solo testo semplice.ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare LaTeX, vietati gli asterischi (*), vietato il simbolo del dollaro ($). Scrivi le formule matematiche a parole in italiano (es. "a al quadrato più b al quadrato uguale c al quadrato").`;
+${slideContextLine}
+REGOLE: 1. NON presentarti mai. 2. Vai dritto al sodo. 3. Sii concisa (max 3 frasi). 4. Solo testo semplice. ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare LaTeX, vietati gli asterischi (*), vietato il simbolo del dollaro ($). Scrivi le formule matematiche a parole in italiano (es. "a al quadrato più b al quadrato uguale c al quadrato").`;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -220,6 +228,27 @@ async function gestisciDomandaUtente(domandaText) {
     lastProactiveIntervention = performance.now();
     isAnsweringUser = false;
     eca.setState('IDLE');
+}
+
+function extractGazedText() {
+    if (pdfTextData.length === 0) return "";
+    const canvases = document.querySelectorAll('.pdf-slide');
+    for (let i = 0; i < canvases.length; i++) {
+        const rect = canvases[i].getBoundingClientRect();
+        if (currentSmoothPos.x >= rect.left && currentSmoothPos.x <= rect.right &&
+            currentSmoothPos.y >= rect.top  && currentSmoothPos.y <= rect.bottom) {
+            if (!pdfTextData[i]) return "";
+            const localX = currentSmoothPos.x - rect.left;
+            const localY = currentSmoothPos.y - rect.top;
+            const RADIUS = 80;
+            const nearby = pdfTextData[i].items
+                .filter(item => Math.hypot(item.x - localX, item.y - localY) < RADIUS)
+                .map(item => item.text.trim())
+                .filter(t => t.length > 0);
+            return nearby.join(' ');
+        }
+    }
+    return "";
 }
 
 function drawFaceMeshSegments(landmarks) {
@@ -290,6 +319,11 @@ async function loop() {
                     gazeDot.style.left = `${smoothPos.x}px`;
                     gazeDot.style.top = `${smoothPos.y}px`;
                     document.getElementById('val-gaze').innerText = `X: ${Math.round(smoothPos.x)}, Y: ${Math.round(smoothPos.y)}`;
+
+                    if (isPdfLoaded && ts - lastGazeContextTs > 500) {
+                        lastGazeContextTs = ts;
+                        currentSlideContext = extractGazedText();
+                    }
                 }
             }
 
@@ -529,6 +563,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 const pdf = await pdfjsLib.getDocument(new Uint8Array(this.result)).promise;
                 slidesContainer.innerHTML = '';
                 slidesContainer.style.display = 'block';
+                pdfTextData = [];
+                currentSlideContext = "";
 
                 for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
                     const page = await pdf.getPage(pageNum);
@@ -540,6 +576,18 @@ document.addEventListener("DOMContentLoaded", () => {
                     slideCanvas.width = viewport.width;
                     slidesContainer.appendChild(slideCanvas);
                     await page.render({ canvasContext: slideCanvas.getContext('2d'), viewport: viewport }).promise;
+
+                    const textContent = await page.getTextContent();
+                    const items = textContent.items
+                        .filter(item => item.str && item.str.trim().length > 0)
+                        .map(item => {
+                            const tx = item.transform[4];
+                            const ty = item.transform[5];
+                            const vx = tx * viewport.scale;
+                            const vy = viewport.height - ty * viewport.scale;
+                            return { text: item.str, x: vx, y: vy };
+                        });
+                    pdfTextData.push({ items });
                 }
 
                 // Aspetta che l'avatar finisca di dire la prima frase, se non l'ha già fatto
