@@ -1,7 +1,4 @@
-# Cartella temporanea di Claude Code
-.claude/
-
-# Eventuali altre cartelle inutili (consigliato)
+backend/.env
 node_modules/
 .DS_Store
 *.log
