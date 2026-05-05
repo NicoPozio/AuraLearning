@@ -39,6 +39,11 @@ const NEGATIVE_STATE_PERSIST_MS = 5000;
 
 // Multi-frame gaze calibration
 const GAZE_SAMPLE_COUNT = 30;
+// IOD di riferimento per il depth correction del gaze.
+// Fissato al momento della calibrazione gaze e MAI più cambiato.
+// Usare affectAnalyzer.baseline.iod causerebbe derive ogni volta
+// che la calibrazione emotiva aggiorna la baseline.
+let gazeBaseIod = 0.20;
 let gazeSampleBuffer = [];
 let isCollectingGazeSample = false;
 
@@ -53,7 +58,7 @@ let micBlockReason = null;
 let ignoreMicUntil = 0;
 let userMicTimeout = null;
 let chatHistory = [];
-let currentEmotionState = "Normale";
+let currentEmotionState = "Normale"; // "Normale" | "In difficoltà"
 
 const affectAnalyzer = new AffectAnalyzer();
 const eca = new ECAController('eca-container');
@@ -162,6 +167,18 @@ async function init() {
         gazeCalibrator.calculateModel();
         isGazeCalibrating = false;
         gazeDot.style.display = 'block';
+        // Salva l'IOD corrente come riferimento fisso per il depth correction.
+        // rawMetrics potrebbe non essere disponibile qui (siamo in callback),
+        // usiamo il valore della baseline emotiva se già calibrata, altrimenti
+        // il valore accumulato nei campioni gaze (mediana degli IOD raccolti).
+        if (affectAnalyzer.isCalibrated && affectAnalyzer.baseline.iod > 0) {
+            gazeBaseIod = affectAnalyzer.baseline.iod;
+        } else if (gazeCalibrator.calibrationPoints.length > 0) {
+            // Fallback: median IOD dai punti di calibrazione gaze stessi
+            // (non disponibile direttamente, teniamo il default 0.20)
+            gazeBaseIod = 0.20;
+        }
+        console.log(`[Gaze] gazeBaseIod fissato a ${gazeBaseIod.toFixed(4)}`);
     });
 
     voiceInput = new VoiceInput(
@@ -250,6 +267,12 @@ async function init() {
 
     if (gazeCalibrator.loadFromStorage?.()) gazeDot.style.display = 'block';
 
+    // Tenta di ricaricare la baseline emotiva da sessione precedente
+    if (affectAnalyzer.loadBaselineFromStorage()) {
+        document.getElementById('val-status').innerText = "Baseline caricata.";
+        updateMicStatusUI();
+    }
+
     // Aggiorna la label mic ogni secondo (per far scadere lo stato anti-echo)
     setInterval(updateMicStatusUI, 1000);
 }
@@ -316,13 +339,18 @@ function updateStatusCard(state) {
     const card = document.getElementById('card-status');
     const val  = document.getElementById('val-status');
     card.classList.remove('alert', 'warning', 'info');
-    if      (state.isFrustrated) { card.classList.add('alert');   val.innerText = "Frustrato"; }
-    else if (state.isConfused)   { card.classList.add('warning'); val.innerText = "Confuso"; }
-    else if (state.isBored)      { card.classList.add('info');    val.innerText = "Annoiato"; }
-    else                         {                                val.innerText = "Normale"; }
+    if (state.isInDifficulty) {
+        card.classList.add('alert');
+        const exprLabel = state.activeExpressions.length > 0
+            ? ` (${state.activeExpressions.slice(0,2).join(', ')})` : '';
+        val.innerText = "In difficoltà" + exprLabel;
+    } else {
+        val.innerText = "Normale";
+    }
 }
 
 async function loop() {
+    try {
     const ts = performance.now();
 
     if (video.currentTime !== lastVideoTime) {
@@ -336,19 +364,22 @@ async function loop() {
 
         const results = faceLandmarker.detectForVideo(video, ts);
 
-        if (results.faceLandmarks?.length > 0) {
+        const hasFace = results.faceLandmarks?.length > 0;
+        affectAnalyzer.updateFaceAbsent(!hasFace, Math.min((performance.now() - lastFrameTimeMs + 16) / 1000, 0.1));
+
+        if (hasFace) { // era: if (results.faceLandmarks?.length > 0)
             const landmarks  = results.faceLandmarks[0];
             drawFaceMeshSegments(landmarks);
 
             const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
-            if (!rawMetrics) { requestAnimationFrame(loop); return; }
+            if (!rawMetrics) { return; } // finally chiama requestAnimationFrame
 
             currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
 
             // Multi-frame calibration
             if (isCollectingGazeSample && currentNormalizedIris) {
                 // FIX: salva valori depth-corrected, coerenti con predict()
-                const _dcCal = (affectAnalyzer.baseline?.iod > 0 ? affectAnalyzer.baseline.iod : 0.20) / rawMetrics.iod;
+                const _dcCal = gazeBaseIod / rawMetrics.iod;
                 gazeSampleBuffer.push({ x: currentNormalizedIris.x * _dcCal, y: currentNormalizedIris.y * _dcCal });
                 calibrationUI.updateProgress(Math.min(gazeSampleBuffer.length / GAZE_SAMPLE_COUNT, 1));
                 if (gazeSampleBuffer.length >= GAZE_SAMPLE_COUNT) {
@@ -364,10 +395,9 @@ async function loop() {
 
             // Gaze prediction
             if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
-                const baseIod = affectAnalyzer.baseline?.iod > 0 ? affectAnalyzer.baseline.iod : 0.20;
                 const rawPos  = gazeCalibrator.predict(
-                    currentNormalizedIris.x * (baseIod / rawMetrics.iod),
-                    currentNormalizedIris.y * (baseIod / rawMetrics.iod)
+                    currentNormalizedIris.x * (gazeBaseIod / rawMetrics.iod),
+                    currentNormalizedIris.y * (gazeBaseIod / rawMetrics.iod)
                 );
                 if (rawPos) {
                     const smooth = uiFilter.filter(rawPos.x, rawPos.y, ts);
@@ -404,18 +434,45 @@ async function loop() {
             } else if (affectAnalyzer.isCalibrated) {
                 const state = affectAnalyzer.update(rawMetrics, dtSec);
 
-                if      (state.isFrustrated) currentEmotionState = "Frustrato";
-                else if (state.isConfused)   currentEmotionState = "Confuso";
-                else if (state.isBored)      currentEmotionState = "Annoiato";
-                else                         currentEmotionState = "Normale";
+                currentEmotionState = state.isInDifficulty ? "In difficoltà" : "Normale";
 
                 document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                 document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
+                // Gaze-away: notifica all'analyzer quando il contesto non è fresco
+                // e il pdf è caricato (proxy: utente sta guardando altrove)
+                if (isPdfLoaded && _getFreshGazeContext().length === 0 && lastGazedTextTimestamp > 0) {
+                    affectAnalyzer.notifyGazeAway();
+                }
 
                 if (!isProactiveInterventionActive && !isAnsweringUser) updateStatusCard(state);
 
+                // Aggiorna debug sidebar
+                if (state.debugSignals) {
+                    const el = document.getElementById('val-debug');
+                    if (el) {
+                        const me = state.debugSignals;
+                        const actives = state.activeExpressions;
+                        const z = state.rawZ;
+                        const fmt = (name, label, signal, zVal, me_active) => {
+                            const dot  = me_active ? '●' : (signal ? '◐' : '○');
+                            const col  = me_active ? '#ef4444' : (signal ? '#f59e0b' : '#94a3b8');
+                            const bold = me_active ? 'font-weight:700;' : '';
+                            return `<span style="color:${col};${bold}">${dot} ${label}: ${zVal.toFixed(2)}σ</span>`;
+                        };
+                        el.innerHTML = [
+                            fmt('browFurrow',  'AU4 Fronte',   me.browFurrow,  z.zCorrugator,    actives.includes('browFurrow')),
+                            fmt('eyeSquint',   'EAR Occhi',    me.eyeSquint,   z.zEar,           actives.includes('eyeSquint')),
+                            fmt('mouthFrown',  'Bocca giù',    me.mouthFrown,  z.zMouthCurvature, actives.includes('mouthFrown')),
+                            fmt('lipPress',    'Labbra prem.', me.lipPress,    z.zLipPress,      actives.includes('lipPress')),
+                            fmt('noseWrinkle', 'Naso AU9',     me.noseWrinkle, z.zNoseWrinkle,   actives.includes('noseWrinkle')),
+                            fmt('browRaise',   'AU1 Sopr.',    me.browRaise,   z.zBrowRaise,     actives.includes('browRaise')),
+                            fmt('mouthOpen',   'Bocca aperta', me.mouthOpen,   z.zMouthOpen,     actives.includes('mouthOpen')),
+                        ].join('<br>');
+                    }
+                }
+
                 // Negative state persistence timer
-                const isNegativeNow = state.isFrustrated || state.isConfused || state.isBored;
+                const isNegativeNow = state.isInDifficulty;
                 if (!isNegativeNow) {
                     negativeStateStartTime = 0;
                 } else if (negativeStateStartTime === 0 && !isProactiveInterventionActive && !isAnsweringUser) {
@@ -435,15 +492,12 @@ async function loop() {
                     eca.setState('THINKING');
 
                     const gazeCtx = _getFreshGazeContext();
+                    const exprList = state.activeExpressions.join(', ') || 'espressione di difficoltà';
                     let prompt;
                     if (gazeCtx.length <= 5) {
-                        prompt = "L'utente sembra in difficoltà ma non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.";
-                    } else if (state.isConfused) {
-                        prompt = "L'utente mostra confusione guardando l'attuale slide. Formula una brevissima domanda (massimo 15 parole) proponendo di rispiegare un termine tecnico specifico presente nel testo.";
-                    } else if (state.isFrustrated) {
-                        prompt = "L'utente mostra segni di frustrazione. Fagli una brevissima proposta empatica (massimo 15 parole) citando l'argomento della slide per aiutarlo a sbloccarsi.";
+                        prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.`;
                     } else {
-                        prompt = "L'utente sembra annoiato. Fagli una breve domanda di coinvolgimento (massimo 15 parole) sull'argomento che stava leggendo.";
+                        prompt = `L'utente mostra ${exprList} mentre studia. Formula una brevissima domanda o proposta empatica (massimo 15 parole) basata sul testo che stava leggendo.`;
                     }
 
                     fetchLLMResponse(prompt).then(phrase => {
@@ -468,13 +522,13 @@ async function loop() {
                         zLip: state.zLip.toFixed(2), zAU1: state.zInnerBrowRaise.toFixed(2),
                         zAU9: state.zNoseWrinkle.toFixed(2),
                         blinkRate: state.blinkRate.toFixed(3),
-                        confusionScore: state.confusionScore,
-                        stressPercentage: state.stressPercentage.toFixed(2),
-                        boredomPercentage: state.boredomPercentage.toFixed(2),
-                        stressDelta: (state.stressPercentage > 0 ? 1 : 0),
-                        isFrustrated: state.isFrustrated ? 1 : 0,
-                        isBored: state.isBored ? 1 : 0,
-                        isConfused: state.isConfused ? 1 : 0,
+
+                        // stressPercentage removed - new binary model
+
+
+                        isInDifficulty: state.isInDifficulty ? 1 : 0,
+                        activeExpressions: state.activeExpressions.join(';'),
+                        gazeAwayCount: state.gazeAwayCount,
                         isSpeaking: state.isSpeaking ? 1 : 0,
                         gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
                         emotionState: currentEmotionState,
@@ -484,7 +538,13 @@ async function loop() {
             }
         }
     }
-    requestAnimationFrame(loop);
+    } catch (err) {
+        // Un errore nel loop non deve mai fermare il rendering.
+        // Logghiamo e riprendiamo nel prossimo frame.
+        console.error('[loop] Errore non gestito:', err);
+    } finally {
+        requestAnimationFrame(loop);
+    }
 }
 
 // ── DOMContentLoaded ───────────────────────────────────────────────────────
@@ -501,6 +561,7 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCalGaze.onclick = () => {
         btnCalGaze.blur();
         gazeCalibrator.reset(); uiFilter.reset();
+        gazeBaseIod = 0.20; // reset: verrà risettato al completamento
         isGazeCalibrating = true;
         isCollectingGazeSample = false; gazeSampleBuffer = [];
         calibrationUI.start();
