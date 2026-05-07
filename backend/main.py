@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import List, Optional
 from groq import AsyncGroq
 import httpx
 import os
@@ -33,10 +34,17 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = "N2lVS1w4EtoT3dr4eOWO"  # Voce di Callum
 
 # --- DATA MODELS ---
+
+# Singolo messaggio della chat history inviato dal frontend
+class ChatMessage(BaseModel):
+    role: str                          # "user" | "model"
+    parts: List[dict]                  # [{"text": "..."}]
+
 class ChatRequest(BaseModel):
     user_text: str
     emotion_state: str
     slide_context: str
+    chat_history: Optional[List[ChatMessage]] = []   # ultime 10 chat
 
 class TTSRequest(BaseModel):
     text: str
@@ -59,26 +67,34 @@ async def chat_endpoint(request: ChatRequest):
             3. Sii concisa (max 3 frasi).
             4. Solo testo semplice. ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare Markdown, vietati gli asterischi, vietati i simboli matematici speciali. Scrivi tutto a parole in italiano."""
 
-        #Groq ha una struttura a ruoli
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": request.user_text}
-        ]
-        
-        #Chiamata asincrona a LLaMA 3 
+        # Costruzione dei messaggi: system + history + messaggio corrente
+        # La chat_history arriva con role "user"/"model" (formato Gemini),
+        # convertiamo "model" → "assistant" per Groq/OpenAI.
+        messages = [{"role": "system", "content": system_prompt}]
+
+        for msg in (request.chat_history or []):
+            groq_role = "assistant" if msg.role == "model" else "user"
+            text_content = msg.parts[0].get("text", "") if msg.parts else ""
+            if text_content.strip():
+                messages.append({"role": groq_role, "content": text_content})
+
+        # Aggiunge il messaggio corrente dell'utente
+        messages.append({"role": "user", "content": request.user_text})
+
+        # Chiamata asincrona a LLaMA 3
         response = await llm_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.7,
-            max_tokens=150 # Manteniamo la risposta concisa
+            max_tokens=150  # Manteniamo la risposta concisa
         )
-        
-        #Estrazione del testo generato
+
+        # Estrazione del testo generato
         answer = response.choices[0].message.content.strip()
         return {"text": answer}
-        
+
     except Exception as e:
-        # AGGIUNTA PER IL DEBUG: stampa l'errore vero nel terminale
+        # Stampa l'errore vero nel terminale per il debug
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Errore LLM: {str(e)}")
@@ -87,7 +103,7 @@ async def chat_endpoint(request: ChatRequest):
 async def tts_endpoint(request: TTSRequest):
     if not ELEVENLABS_API_KEY:
         raise HTTPException(status_code=500, detail="ElevenLabs API Key mancante nel server.")
-        
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?optimize_streaming_latency=3"
     headers = {
         "Accept": "audio/mpeg",
@@ -102,13 +118,13 @@ async def tts_endpoint(request: TTSRequest):
             "similarity_boost": 0.75
         }
     }
-    
+
     async with httpx.AsyncClient() as client:
         response = await client.post(url, headers=headers, json=payload, timeout=30.0)
-        
+
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail="Errore dal provider TTS")
-        
+
     return StreamingResponse(io.BytesIO(response.content), media_type="audio/mpeg")
 
 app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")

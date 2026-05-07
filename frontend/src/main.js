@@ -148,6 +148,71 @@ function median(arr) {
     return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
 }
 
+// ── NEW: recupera tutto il testo della slide attualmente visibile nel viewport ──
+// Usato come fallback quando il gaze non punta a nessun textLayer.
+// Restituisce il testo della slide il cui wrapper è più al centro del viewport,
+// oppure stringa vuota se non trovato.
+function getVisibleSlideText() {
+    const wrappers = Array.from(document.querySelectorAll('.pdf-slide-wrapper'));
+    if (wrappers.length === 0) return "";
+
+    const viewportMid = window.scrollY + window.innerHeight / 2;
+
+    // Trova il wrapper più vicino al centro del viewport
+    let bestWrapper = null;
+    let bestDist = Infinity;
+    for (const w of wrappers) {
+        const rect = w.getBoundingClientRect();
+        const absTop = rect.top + window.scrollY;
+        const mid = absTop + rect.height / 2;
+        const dist = Math.abs(mid - viewportMid);
+        if (dist < bestDist) { bestDist = dist; bestWrapper = w; }
+    }
+
+    if (!bestWrapper) return "";
+
+    // Estrae tutto il testo dal textLayer di quella slide
+    const textLayer = bestWrapper.querySelector('.textLayer');
+    if (!textLayer) return ""; // slide senza testo (solo immagine) → stringa vuota
+
+    const text = Array.from(textLayer.children)
+        .map(el => el.textContent.trim())
+        .filter(t => t.length > 0)
+        .join(' ')
+        .trim();
+
+    return text;
+}
+
+// ── NEW: controlla se la slide visibile è solo immagine (nessun textLayer con testo) ──
+function isVisibleSlideImageOnly() {
+    const wrappers = Array.from(document.querySelectorAll('.pdf-slide-wrapper'));
+    if (wrappers.length === 0) return false;
+
+    const viewportMid = window.scrollY + window.innerHeight / 2;
+    let bestWrapper = null;
+    let bestDist = Infinity;
+    for (const w of wrappers) {
+        const rect = w.getBoundingClientRect();
+        const absTop = rect.top + window.scrollY;
+        const mid = absTop + rect.height / 2;
+        const dist = Math.abs(mid - viewportMid);
+        if (dist < bestDist) { bestDist = dist; bestWrapper = w; }
+    }
+
+    if (!bestWrapper) return false;
+
+    const textLayer = bestWrapper.querySelector('.textLayer');
+    if (!textLayer) return true;
+
+    const text = Array.from(textLayer.children)
+        .map(el => el.textContent.trim())
+        .filter(t => t.length > 0)
+        .join('');
+
+    return text.length === 0;
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 
 async function init() {
@@ -221,7 +286,7 @@ async function init() {
             if (userMicTimeout) clearTimeout(userMicTimeout);
 
             if (final) {
-                const text  = final.trim();
+                const text = final.trim();
                 const lower = text.toLowerCase();
                 currentFinalTranscript = text;
                 voiceDiv.innerHTML = `<span style="color:#0f172a;font-weight:600;">${text}</span>`;
@@ -280,10 +345,13 @@ async function init() {
 // ── LLM ───────────────────────────────────────────────────────────────────
 
 async function fetchLLMResponse(userText) {
+    // Ultime 10 chat (escluso il messaggio corrente che viene aggiunto dopo)
+    const recentHistory = chatHistory.slice(-10);
     const payload = {
         user_text: userText,
         emotion_state: currentEmotionState,
-        slide_context: _getFreshGazeContext()
+        slide_context: _getFreshGazeContext(),
+        chat_history: recentHistory
     };
     try {
         const res = await fetch("http://localhost:8000/api/chat", {
@@ -323,26 +391,26 @@ function drawFaceMeshSegments(landmarks) {
         indices.forEach((idx, i) => {
             const pt = landmarks[idx];
             if (i === 0) ctx.moveTo(pt.x * canvas.width, pt.y * canvas.height);
-            else         ctx.lineTo(pt.x * canvas.width, pt.y * canvas.height);
+            else ctx.lineTo(pt.x * canvas.width, pt.y * canvas.height);
         });
         if (close) ctx.closePath();
         ctx.stroke();
     };
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows,     'rgba(43,87,151,0.8)');
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye,   'rgba(0,180,0,0.8)', true);
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye,  'rgba(0,180,0,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows, 'rgba(43,87,151,0.8)');
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye, 'rgba(0,180,0,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye, 'rgba(0,180,0,0.8)', true);
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.outerLips, 'rgba(185,29,71,0.8)', true);
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.innerLips, 'rgba(185,29,71,0.8)', true);
 }
 
 function updateStatusCard(state) {
     const card = document.getElementById('card-status');
-    const val  = document.getElementById('val-status');
+    const val = document.getElementById('val-status');
     card.classList.remove('alert', 'warning', 'info');
     if (state.isInDifficulty) {
         card.classList.add('alert');
         const exprLabel = state.activeExpressions.length > 0
-            ? ` (${state.activeExpressions.slice(0,2).join(', ')})` : '';
+            ? ` (${state.activeExpressions.slice(0, 2).join(', ')})` : '';
         val.innerText = "In difficoltà" + exprLabel;
     } else {
         val.innerText = "Normale";
@@ -351,193 +419,211 @@ function updateStatusCard(state) {
 
 async function loop() {
     try {
-    const ts = performance.now();
+        const ts = performance.now();
 
-    if (video.currentTime !== lastVideoTime) {
-        const dtSec = Math.min((ts - lastFrameTimeMs) / 1000.0, 0.1);
-        lastFrameTimeMs = ts;
-        lastVideoTime   = video.currentTime;
+        if (video.currentTime !== lastVideoTime) {
+            const dtSec = Math.min((ts - lastFrameTimeMs) / 1000.0, 0.1);
+            lastFrameTimeMs = ts;
+            lastVideoTime = video.currentTime;
 
-        eca.update(dtSec);
-        canvas.width  = video.videoWidth;
-        canvas.height = video.videoHeight;
+            eca.update(dtSec);
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
 
-        const results = faceLandmarker.detectForVideo(video, ts);
+            const results = faceLandmarker.detectForVideo(video, ts);
 
-        const hasFace = results.faceLandmarks?.length > 0;
-        affectAnalyzer.updateFaceAbsent(!hasFace, Math.min((performance.now() - lastFrameTimeMs + 16) / 1000, 0.1));
+            const hasFace = results.faceLandmarks?.length > 0;
+            affectAnalyzer.updateFaceAbsent(!hasFace, Math.min((performance.now() - lastFrameTimeMs + 16) / 1000, 0.1));
 
-        if (hasFace) { // era: if (results.faceLandmarks?.length > 0)
-            const landmarks  = results.faceLandmarks[0];
-            drawFaceMeshSegments(landmarks);
+            if (hasFace) { // era: if (results.faceLandmarks?.length > 0)
+                const landmarks = results.faceLandmarks[0];
+                drawFaceMeshSegments(landmarks);
 
-            const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
-            if (!rawMetrics) { return; } // finally chiama requestAnimationFrame
+                const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
+                if (!rawMetrics) { return; } // finally chiama requestAnimationFrame
 
-            currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
+                currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
 
-            // Multi-frame calibration
-            if (isCollectingGazeSample && currentNormalizedIris) {
-                // FIX: salva valori depth-corrected, coerenti con predict()
-                const _dcCal = gazeBaseIod / rawMetrics.iod;
-                gazeSampleBuffer.push({ x: currentNormalizedIris.x * _dcCal, y: currentNormalizedIris.y * _dcCal });
-                calibrationUI.updateProgress(Math.min(gazeSampleBuffer.length / GAZE_SAMPLE_COUNT, 1));
-                if (gazeSampleBuffer.length >= GAZE_SAMPLE_COUNT) {
-                    const medX = median(gazeSampleBuffer.map(p => p.x));
-                    const medY = median(gazeSampleBuffer.map(p => p.y));
-                    const target = calibrationUI.getNextPointCoords();
-                    gazeCalibrator.recordDataPoint(medX, medY, target.x, target.y);
-                    calibrationUI.advance();
-                    gazeSampleBuffer = [];
-                    isCollectingGazeSample = false;
+                // Multi-frame calibration
+                if (isCollectingGazeSample && currentNormalizedIris) {
+                    // FIX: salva valori depth-corrected, coerenti con predict()
+                    const _dcCal = gazeBaseIod / rawMetrics.iod;
+                    gazeSampleBuffer.push({ x: currentNormalizedIris.x * _dcCal, y: currentNormalizedIris.y * _dcCal });
+                    calibrationUI.updateProgress(Math.min(gazeSampleBuffer.length / GAZE_SAMPLE_COUNT, 1));
+                    if (gazeSampleBuffer.length >= GAZE_SAMPLE_COUNT) {
+                        const medX = median(gazeSampleBuffer.map(p => p.x));
+                        const medY = median(gazeSampleBuffer.map(p => p.y));
+                        const target = calibrationUI.getNextPointCoords();
+                        gazeCalibrator.recordDataPoint(medX, medY, target.x, target.y);
+                        calibrationUI.advance();
+                        gazeSampleBuffer = [];
+                        isCollectingGazeSample = false;
+                    }
                 }
-            }
 
-            // Gaze prediction
-            if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
-                const rawPos  = gazeCalibrator.predict(
-                    currentNormalizedIris.x * (gazeBaseIod / rawMetrics.iod),
-                    currentNormalizedIris.y * (gazeBaseIod / rawMetrics.iod)
-                );
-                if (rawPos) {
-                    const smooth = uiFilter.filter(rawPos.x, rawPos.y, ts);
-                    currentSmoothPos = smooth;
-                    gazeDot.style.left    = `${smooth.x}px`;
-                    gazeDot.style.top     = `${smooth.y}px`;
-                    if (rawPos.confidence !== undefined)
-                        gazeDot.style.opacity = (0.4 + 0.6 * rawPos.confidence).toFixed(2);
-                    document.getElementById('val-gaze').innerText =
-                        `X: ${Math.round(smooth.x)}, Y: ${Math.round(smooth.y)}`;
+                // Gaze prediction
+                if (!isGazeCalibrating && gazeCalibrator.regressionModel) {
+                    const rawPos = gazeCalibrator.predict(
+                        currentNormalizedIris.x * (gazeBaseIod / rawMetrics.iod),
+                        currentNormalizedIris.y * (gazeBaseIod / rawMetrics.iod)
+                    );
+                    if (rawPos) {
+                        const smooth = uiFilter.filter(rawPos.x, rawPos.y, ts);
+                        currentSmoothPos = smooth;
+                        gazeDot.style.left = `${smooth.x}px`;
+                        gazeDot.style.top = `${smooth.y}px`;
+                        if (rawPos.confidence !== undefined)
+                            gazeDot.style.opacity = (0.4 + 0.6 * rawPos.confidence).toFixed(2);
+                        document.getElementById('val-gaze').innerText =
+                            `X: ${Math.round(smooth.x)}, Y: ${Math.round(smooth.y)}`;
+                    }
                 }
-            }
 
-            // Emotion calibration
-            if (affectAnalyzer.isCalibrating) {
-                const done = affectAnalyzer.processCalibrationSample(rawMetrics);
-                if (done) {
-                    calOverlay.style.display = 'none';
-                    document.getElementById('val-status').innerText = "Calibrazione completata.";
-                    updateMicStatusUI();
-                    setTimeout(async () => {
-                        isProactiveInterventionActive = true;
-                        try {
-                            const msg = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
-                            addChatMessage('ai', msg);
-                            await speakECA(msg);
-                        } finally {
-                            isProactiveInterventionActive = false;
-                            updateMicStatusUI();
+                // Emotion calibration
+                if (affectAnalyzer.isCalibrating) {
+                    const done = affectAnalyzer.processCalibrationSample(rawMetrics);
+                    if (done) {
+                        calOverlay.style.display = 'none';
+                        document.getElementById('val-status').innerText = "Calibrazione completata.";
+                        updateMicStatusUI();
+                        setTimeout(async () => {
+                            isProactiveInterventionActive = true;
+                            try {
+                                const msg = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
+                                addChatMessage('ai', msg);
+                                await speakECA(msg);
+                            } finally {
+                                isProactiveInterventionActive = false;
+                                updateMicStatusUI();
+                            }
+                        }, 1000);
+                    }
+
+                } else if (affectAnalyzer.isCalibrated) {
+                    const state = affectAnalyzer.update(rawMetrics, dtSec);
+
+                    currentEmotionState = state.isInDifficulty ? "In difficoltà" : "Normale";
+
+                    document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
+                    document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
+                    // Gaze-away: notifica all'analyzer quando il contesto non è fresco
+                    // e il pdf è caricato (proxy: utente sta guardando altrove)
+                    if (isPdfLoaded && _getFreshGazeContext().length === 0 && lastGazedTextTimestamp > 0) {
+                        affectAnalyzer.notifyGazeAway();
+                    }
+
+                    if (!isProactiveInterventionActive && !isAnsweringUser) updateStatusCard(state);
+
+                    // Aggiorna debug sidebar
+                    if (state.debugSignals) {
+                        const el = document.getElementById('val-debug');
+                        if (el) {
+                            const me = state.debugSignals;
+                            const actives = state.activeExpressions;
+                            const z = state.rawZ;
+                            const fmt = (name, label, signal, zVal, me_active) => {
+                                const dot = me_active ? '●' : (signal ? '◐' : '○');
+                                const col = me_active ? '#ef4444' : (signal ? '#f59e0b' : '#94a3b8');
+                                const bold = me_active ? 'font-weight:700;' : '';
+                                return `<span style="color:${col};${bold}">${dot} ${label}: ${zVal.toFixed(2)}σ</span>`;
+                            };
+                            el.innerHTML = [
+                                fmt('browFurrow', 'AU4 Fronte', me.browFurrow, z.zCorrugator, actives.includes('browFurrow')),
+                                fmt('eyeSquint', 'EAR Occhi', me.eyeSquint, z.zEar, actives.includes('eyeSquint')),
+                                fmt('mouthFrown', 'Bocca giù', me.mouthFrown, z.zMouthCurvature, actives.includes('mouthFrown')),
+                                fmt('lipPress', 'Labbra prem.', me.lipPress, z.zLipPress, actives.includes('lipPress')),
+                                fmt('noseWrinkle', 'Naso AU9', me.noseWrinkle, z.zNoseWrinkle, actives.includes('noseWrinkle')),
+                                fmt('browRaise', 'AU1 Sopr.', me.browRaise, z.zBrowRaise, actives.includes('browRaise')),
+                                fmt('mouthOpen', 'Bocca aperta', me.mouthOpen, z.zMouthOpen, actives.includes('mouthOpen')),
+                            ].join('<br>');
                         }
-                    }, 1000);
-                }
-
-            } else if (affectAnalyzer.isCalibrated) {
-                const state = affectAnalyzer.update(rawMetrics, dtSec);
-
-                currentEmotionState = state.isInDifficulty ? "In difficoltà" : "Normale";
-
-                document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
-                document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
-                // Gaze-away: notifica all'analyzer quando il contesto non è fresco
-                // e il pdf è caricato (proxy: utente sta guardando altrove)
-                if (isPdfLoaded && _getFreshGazeContext().length === 0 && lastGazedTextTimestamp > 0) {
-                    affectAnalyzer.notifyGazeAway();
-                }
-
-                if (!isProactiveInterventionActive && !isAnsweringUser) updateStatusCard(state);
-
-                // Aggiorna debug sidebar
-                if (state.debugSignals) {
-                    const el = document.getElementById('val-debug');
-                    if (el) {
-                        const me = state.debugSignals;
-                        const actives = state.activeExpressions;
-                        const z = state.rawZ;
-                        const fmt = (name, label, signal, zVal, me_active) => {
-                            const dot  = me_active ? '●' : (signal ? '◐' : '○');
-                            const col  = me_active ? '#ef4444' : (signal ? '#f59e0b' : '#94a3b8');
-                            const bold = me_active ? 'font-weight:700;' : '';
-                            return `<span style="color:${col};${bold}">${dot} ${label}: ${zVal.toFixed(2)}σ</span>`;
-                        };
-                        el.innerHTML = [
-                            fmt('browFurrow',  'AU4 Fronte',   me.browFurrow,  z.zCorrugator,    actives.includes('browFurrow')),
-                            fmt('eyeSquint',   'EAR Occhi',    me.eyeSquint,   z.zEar,           actives.includes('eyeSquint')),
-                            fmt('mouthFrown',  'Bocca giù',    me.mouthFrown,  z.zMouthCurvature, actives.includes('mouthFrown')),
-                            fmt('lipPress',    'Labbra prem.', me.lipPress,    z.zLipPress,      actives.includes('lipPress')),
-                            fmt('noseWrinkle', 'Naso AU9',     me.noseWrinkle, z.zNoseWrinkle,   actives.includes('noseWrinkle')),
-                            fmt('browRaise',   'AU1 Sopr.',    me.browRaise,   z.zBrowRaise,     actives.includes('browRaise')),
-                            fmt('mouthOpen',   'Bocca aperta', me.mouthOpen,   z.zMouthOpen,     actives.includes('mouthOpen')),
-                        ].join('<br>');
-                    }
-                }
-
-                // Negative state persistence timer
-                const isNegativeNow = state.isInDifficulty;
-                if (!isNegativeNow) {
-                    negativeStateStartTime = 0;
-                } else if (negativeStateStartTime === 0 && !isProactiveInterventionActive && !isAnsweringUser) {
-                    negativeStateStartTime = ts;
-                }
-
-                const negativeMs   = negativeStateStartTime > 0 ? ts - negativeStateStartTime : 0;
-                const isPersistent = negativeMs >= NEGATIVE_STATE_PERSIST_MS;
-                const canIntervene = !firstInterventionDone || (ts - lastProactiveIntervention) > PROACTIVE_COOLDOWN_MS;
-
-                if (isPdfLoaded && isPersistent && canIntervene && !isProactiveInterventionActive && !isAnsweringUser) {
-                    console.log(`[AURA] Intervento dopo ${(negativeMs/1000).toFixed(1)}s: ${currentEmotionState}`);
-                    isProactiveInterventionActive = true;
-                    firstInterventionDone = true;
-                    lastProactiveIntervention = ts;
-                    negativeStateStartTime = 0;
-                    eca.setState('THINKING');
-
-                    const gazeCtx = _getFreshGazeContext();
-                    const exprList = state.activeExpressions.join(', ') || 'espressione di difficoltà';
-                    let prompt;
-                    if (gazeCtx.length <= 5) {
-                        prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.`;
-                    } else {
-                        prompt = `L'utente mostra ${exprList} mentre studia. Formula una brevissima domanda o proposta empatica (massimo 15 parole) basata sul testo che stava leggendo.`;
                     }
 
-                    fetchLLMResponse(prompt).then(phrase => {
-                        addChatMessage('ai', phrase);
-                        speakECA(phrase).then(() => {
-                            isProactiveInterventionActive = false;
-                            negativeStateStartTime = 0;
-                            updateMicStatusUI();
+                    // Negative state persistence timer
+                    const isNegativeNow = state.isInDifficulty;
+                    if (!isNegativeNow) {
+                        negativeStateStartTime = 0;
+                    } else if (negativeStateStartTime === 0 && !isProactiveInterventionActive && !isAnsweringUser) {
+                        negativeStateStartTime = ts;
+                    }
+
+                    const negativeMs = negativeStateStartTime > 0 ? ts - negativeStateStartTime : 0;
+                    const isPersistent = negativeMs >= NEGATIVE_STATE_PERSIST_MS;
+                    const canIntervene = !firstInterventionDone || (ts - lastProactiveIntervention) > PROACTIVE_COOLDOWN_MS;
+
+                    if (isPdfLoaded && isPersistent && canIntervene && !isProactiveInterventionActive && !isAnsweringUser) {
+                        console.log(`[AURA] Intervento dopo ${(negativeMs / 1000).toFixed(1)}s: ${currentEmotionState}`);
+                        isProactiveInterventionActive = true;
+                        firstInterventionDone = true;
+                        lastProactiveIntervention = ts;
+                        negativeStateStartTime = 0;
+                        eca.setState('THINKING');
+
+                        // ── NEW: logica a 3 casi per il contesto dell'intervento proattivo ──
+                        const gazeCtx = _getFreshGazeContext();
+                        const exprList = state.activeExpressions.join(', ') || 'espressione di difficoltà';
+                        let prompt;
+
+                        if (gazeCtx.length > 5) {
+                            // CASO A: il gaze punta a del testo → usa lo snippet estratto
+                            console.log(`[AURA] Caso A — snippet gaze: "${gazeCtx.substring(0, 60)}..."`);
+                            prompt = `L'utente mostra ${exprList} mentre studia. Sta leggendo questo testo tratto dalla slide:\n"${gazeCtx}"\nFormula una brevissima domanda o proposta empatica (massimo 15 parole) basata su quel contenuto specifico.`;
+
+                        } else if (isVisibleSlideImageOnly()) {
+                            // CASO C: slide senza testo (solo immagine) → messaggio standard
+                            console.log(`[AURA] Caso C — slide solo immagine, messaggio standard`);
+                            prompt = `L'utente mostra ${exprList} guardando una slide che contiene solo immagini, senza testo. Chiedigli brevemente (massimo 10 parole) se ha bisogno di aiuto, in modo empatico.`;
+
+                        } else {
+                            // CASO B: gaze fuori dal testo ma la slide ha testo → manda tutto il testo della slide
+                            const slideText = getVisibleSlideText();
+                            if (slideText.length > 5) {
+                                console.log(`[AURA] Caso B — testo intera slide: "${slideText.substring(0, 60)}..."`);
+                                prompt = `L'utente mostra ${exprList}. Non riesco a rilevare esattamente dove stia guardando, ma la slide che sta visualizzando contiene questo testo:\n"${slideText}"\nFormula una domanda diretta e breve (massimo 15 parole) per capire se ha difficoltà con quel contenuto.`;
+                            } else {
+                                // Fallback: slide senza testo rilevabile (raro, safety net)
+                                console.log(`[AURA] Fallback — nessun testo rilevabile`);
+                                prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.`;
+                            }
+                        }
+                        // ── END NEW ──
+
+                        fetchLLMResponse(prompt).then(phrase => {
+                            addChatMessage('ai', phrase);
+                            speakECA(phrase).then(() => {
+                                isProactiveInterventionActive = false;
+                                negativeStateStartTime = 0;
+                                updateMicStatusUI();
+                            });
                         });
-                    });
-                }
+                    }
 
-                if (gazeCalibrator.regressionModel) {
-                    sessionData.push({
-                        timestamp: ts.toFixed(2), dtSec: dtSec.toFixed(4),
-                        rawGazeX: currentNormalizedIris?.x.toFixed(5) ?? "0",
-                        rawGazeY: currentNormalizedIris?.y.toFixed(5) ?? "0",
-                        smoothGazeX: currentSmoothPos.x.toFixed(2),
-                        smoothGazeY: currentSmoothPos.y.toFixed(2),
-                        iod: rawMetrics.iod.toFixed(4),
-                        zAU4: state.zCorrugator.toFixed(2), zEar: state.zEar.toFixed(2),
-                        zLip: state.zLip.toFixed(2), zAU1: state.zInnerBrowRaise.toFixed(2),
-                        zAU9: state.zNoseWrinkle.toFixed(2),
-                        blinkRate: state.blinkRate.toFixed(3),
-
-                        // stressPercentage removed - new binary model
-
-
-                        isInDifficulty: state.isInDifficulty ? 1 : 0,
-                        activeExpressions: state.activeExpressions.join(';'),
-                        gazeAwayCount: state.gazeAwayCount,
-                        isSpeaking: state.isSpeaking ? 1 : 0,
-                        gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
-                        emotionState: currentEmotionState,
-                        spokenText: currentFinalTranscript
-                    });
+                    if (gazeCalibrator.regressionModel) {
+                        sessionData.push({
+                            timestamp: ts.toFixed(2), dtSec: dtSec.toFixed(4),
+                            rawGazeX: currentNormalizedIris?.x.toFixed(5) ?? "0",
+                            rawGazeY: currentNormalizedIris?.y.toFixed(5) ?? "0",
+                            smoothGazeX: currentSmoothPos.x.toFixed(2),
+                            smoothGazeY: currentSmoothPos.y.toFixed(2),
+                            iod: rawMetrics.iod.toFixed(4),
+                            zAU4: state.zCorrugator?.toFixed(2) ?? "0",
+                            zEar: state.zEar?.toFixed(2) ?? "0",
+                            zLip: state.zLip?.toFixed(2) ?? "0",          // ← era senza ?.
+                            zAU1: state.zInnerBrowRaise?.toFixed(2) ?? "0", // ← era senza ?.
+                            zAU9: state.zNoseWrinkle?.toFixed(2) ?? "0",
+                            blinkRate: state.blinkRate?.toFixed(3) ?? "0",
+                            isInDifficulty: state.isInDifficulty ? 1 : 0,
+                            activeExpressions: state.activeExpressions.join(';'),
+                            gazeAwayCount: state.gazeAwayCount,
+                            isSpeaking: state.isSpeaking ? 1 : 0,
+                            gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
+                            emotionState: currentEmotionState,
+                            spokenText: currentFinalTranscript
+                        });
+                    }
                 }
             }
         }
-    }
     } catch (err) {
         // Un errore nel loop non deve mai fermare il rendering.
         // Logghiamo e riprendiamo nel prossimo frame.
@@ -550,13 +636,13 @@ async function loop() {
 // ── DOMContentLoaded ───────────────────────────────────────────────────────
 
 document.addEventListener("DOMContentLoaded", () => {
-    video         = document.getElementById('webcam');
-    canvas        = document.getElementById('output-canvas');
-    ctx           = canvas.getContext('2d');
-    gazeDot       = document.getElementById('gaze-dot');
-    btnCalGaze    = document.getElementById('btn-cal-gaze');
+    video = document.getElementById('webcam');
+    canvas = document.getElementById('output-canvas');
+    ctx = canvas.getContext('2d');
+    gazeDot = document.getElementById('gaze-dot');
+    btnCalGaze = document.getElementById('btn-cal-gaze');
     btnCalEmotion = document.getElementById('btn-cal-emotion');
-    calOverlay    = document.getElementById('cal-overlay');
+    calOverlay = document.getElementById('cal-overlay');
 
     btnCalGaze.onclick = () => {
         btnCalGaze.blur();
@@ -571,7 +657,7 @@ document.addEventListener("DOMContentLoaded", () => {
         btnCalEmotion.blur();
         if (voiceInput && !voiceInput.isListening) voiceInput.start();
         eca.currentAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-        eca.currentAudio.play().catch(() => {});
+        eca.currentAudio.play().catch(() => { });
         calOverlay.style.display = 'block';
         document.getElementById('val-status').innerText = "Acquisizione Baseline...";
         affectAnalyzer.startCalibration();
@@ -642,16 +728,16 @@ document.addEventListener("DOMContentLoaded", () => {
         if (cc) cc.style.display = 'none';
     });
 
-    const dropZone        = document.getElementById('pdf-drop-zone');
-    const inputPdf        = document.getElementById('input-pdf');
+    const dropZone = document.getElementById('pdf-drop-zone');
+    const inputPdf = document.getElementById('input-pdf');
     const slidesContainer = document.getElementById('slides-container');
-    const pdfSpinner      = document.getElementById('pdf-loading-spinner');
+    const pdfSpinner = document.getElementById('pdf-loading-spinner');
 
     if (dropZone && inputPdf && slidesContainer) {
-        dropZone.onclick    = () => inputPdf.click();
+        dropZone.onclick = () => inputPdf.click();
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('dragover'); };
-        dropZone.ondrop     = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
-        inputPdf.onchange   = (e) => handlePdfUpload(e.target.files[0]);
+        dropZone.ondrop = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
+        inputPdf.onchange = (e) => handlePdfUpload(e.target.files[0]);
     }
 
     async function handlePdfUpload(file) {
@@ -665,9 +751,9 @@ document.addEventListener("DOMContentLoaded", () => {
         isPdfLoaded = false;
         currentGazedText = ""; lastGazedTextTimestamp = 0; _lastExtractedSnippet = "";
 
-        if (dropZone)        dropZone.style.display = 'none';
+        if (dropZone) dropZone.style.display = 'none';
         if (slidesContainer) slidesContainer.style.display = 'none';
-        if (pdfSpinner)      pdfSpinner.style.display = 'block';
+        if (pdfSpinner) pdfSpinner.style.display = 'block';
 
         const auraPromise = speakECA("Sto analizzando le slide, preparo il livello semantico.");
 
@@ -689,7 +775,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 let totalTextItems = 0;
 
                 for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-                    const page     = await pdf.getPage(pageNum);
+                    const page = await pdf.getPage(pageNum);
                     const viewport = page.getViewport({ scale: 1.5 });
 
                     const pageWrapper = document.createElement('div');
@@ -772,7 +858,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!element.parentNode?.classList?.contains('textLayer')) return;
 
         const siblings = Array.from(element.parentNode.children);
-        const index    = siblings.indexOf(element);
+        const index = siblings.indexOf(element);
         if (index === -1) return;
 
         const snippet = siblings
@@ -784,6 +870,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (_snippetChangedSignificantly(snippet, _lastExtractedSnippet)) {
             currentGazedText = snippet;
             _lastExtractedSnippet = snippet;
+            console.log(`[GAZE] Testo rilevato: "${snippet.substring(0, 80)}..."`); // ← aggiunta
         }
         lastGazedTextTimestamp = performance.now();
     }

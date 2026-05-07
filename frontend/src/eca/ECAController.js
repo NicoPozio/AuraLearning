@@ -217,6 +217,31 @@ export class ECAController {
     }
 
     async speak(text) {
+        // --- INIZIO VERSIONE MUTATA (RISPARMIO CREDITI) ---
+        console.log(`🔇 [AURA MUTED] Testo da pronunciare: "${text}"`);
+
+        // Simula il tempo di caricamento/risposta del TTS (opzionale ma utile per il flusso)
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        this.isSpeaking = true;
+        this.setState('SPEAKING');
+
+        return new Promise((resolve) => {
+            // Calcoliamo una durata simulata basata sulla lunghezza del testo
+            // Stimiamo circa 100 millisecondi a carattere, con un minimo di 2 secondi
+            const durationMs = Math.max(2000, text.length * 100);
+
+            setTimeout(() => {
+                this.isSpeaking = false;
+                this.setState('IDLE');
+                resolve();
+            }, durationMs);
+        });
+
+        // --- FINE VERSIONE MUTATA ---
+
+        /*
+        // 🚨 CODICE ORIGINALE (COMMENTATO PER RISPARMIARE CREDITI ELEVENLABS) 🚨
         if (this.audioContext && this.audioContext.state === 'suspended') this.audioContext.resume();
         this.currentAudio.pause();
         
@@ -250,7 +275,6 @@ export class ECAController {
                     this.setState('SPEAKING');
                 };
 
-                // ECCO LA CORREZIONE: onended invece di onend!
                 this.currentAudio.onended = () => {
                     this.isSpeaking = false;
                     this.setState('IDLE');
@@ -278,6 +302,7 @@ export class ECAController {
             this.isSpeaking = false;
             this.setState('IDLE');
         }
+        */
     }
 
     onWindowResize() {

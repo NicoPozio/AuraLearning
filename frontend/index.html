@@ -273,6 +273,7 @@
             animation: spin 1s linear infinite;
             margin: 0 auto;
         }
+
         .textLayer {
             position: absolute;
             left: 0;
@@ -280,10 +281,12 @@
             right: 0;
             bottom: 0;
             overflow: hidden;
-            opacity: 0; /* Mantiene il testo invisibile ma tracciabile dal mouse/gaze */
+            opacity: 0;
+            /* Mantiene il testo invisibile ma tracciabile dal mouse/gaze */
             line-height: 1.0;
         }
-        .textLayer > span {
+
+        .textLayer>span {
             color: transparent;
             position: absolute;
             white-space: pre;
@@ -376,7 +379,7 @@
             <div class="data-card metric-card" id="card-debug" style="border-left-color:#94a3b8;">
                 <div class="data-title" style="display:flex;justify-content:space-between;">
                     <span>Segnali ME (debug)</span>
-                    <span style="color:#94a3b8;font-size:0.7rem;">● attivo  ○ inattivo</span>
+                    <span style="color:#94a3b8;font-size:0.7rem;">● attivo ○ inattivo</span>
                 </div>
                 <div id="val-debug" style="font-family:monospace;font-size:0.8rem;line-height:1.7;color:#475569;">
                     In attesa...
