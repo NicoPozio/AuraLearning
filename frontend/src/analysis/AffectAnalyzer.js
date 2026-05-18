@@ -50,7 +50,7 @@ export class AffectAnalyzer {
         //   _offSinceMs  = timer disattivazione (segnale OFF dopo attivazione)
         this._MEs = {
             browFurrow:  { zThresh: 1.0, durationMs: 1800, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
-            eyeSquint:   { zThresh: 1.0, durationMs: 1000, deactivateMs:  800, _sinceMs: 0, _offSinceMs: 0, active: false },
+            eyeSquint:   { zThresh: 1.1, durationMs: 1400, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
             lipPress:    { zThresh: 1.2, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthOpen:   { zThresh: 1.5, durationMs: 1500, deactivateMs:  800, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthFrown:  { zThresh: 1.0, durationMs: 1500, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
