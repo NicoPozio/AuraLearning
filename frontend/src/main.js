@@ -15,7 +15,7 @@ let currentSmoothPos = { x: 0, y: 0 };
 let currentFinalTranscript = "";
 let currentGazedText = "";
 let lastGazedTextTimestamp = 0;
-const GAZE_CONTEXT_TTL_MS = 4000;
+const GAZE_CONTEXT_TTL_MS = 3000;
 let _lastExtractedSnippet = "";
 let textExtractionInterval = null;
 
@@ -41,19 +41,13 @@ const NEGATIVE_STATE_PERSIST_MS = 5000;
 const GAZE_SAMPLE_COUNT = 30;
 // IOD di riferimento per il depth correction del gaze.
 // Fissato al momento della calibrazione gaze e MAI più cambiato.
-// Usare affectAnalyzer.baseline.iod causerebbe derive ogni volta
-// che la calibrazione emotiva aggiorna la baseline.
 let gazeBaseIod = 0.20;
 let gazeSampleBuffer = [];
 let isCollectingGazeSample = false;
 
 // ── STT state ──────────────────────────────────────────────────────────────
-// FIX: wake word usa regex con word boundary — evita "paura", "laura", ecc.
+// Wake word: regex con word boundary — evita match su "paura", "laura", ecc.
 const WAKE_WORD_RE = /\baura\b/i;
-
-// Motivo del blocco mic — mostrato nella UI al posto del generico "Spento"
-// Valori: null | 'echo' | 'pdf' | 'answering' | 'intervention' | 'calibrating'
-let micBlockReason = null;
 
 let ignoreMicUntil = 0;
 let userMicTimeout = null;
@@ -82,10 +76,9 @@ function addChatMessage(sender, text) {
     chatHistory.push({ role: sender === 'user' ? 'user' : 'model', parts: [{ text }] });
 }
 
-// FIX: flush del buffer STT dopo ECA speech per eliminare l'eco accumulato
+// Flush del buffer STT dopo ECA speech per eliminare l'eco accumulato
 async function speakECA(text) {
     ignoreMicUntil = Infinity;
-    micBlockReason = 'echo';
     updateMicStatusUI();
     try {
         await eca.speak(text);
@@ -95,8 +88,6 @@ async function speakECA(text) {
         // Svuota il buffer audio del motore STT prima di riaprire il gate
         if (voiceInput) voiceInput.flush();
         ignoreMicUntil = performance.now() + 1500;
-        // micBlockReason viene resettato nel prossimo aggiornamento UI
-        // (dopo che ignoreMicUntil scade, il prossimo frame di stato lo corregge)
     }
 }
 
@@ -148,17 +139,14 @@ function median(arr) {
     return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
 }
 
-// ── NEW: recupera tutto il testo della slide attualmente visibile nel viewport ──
+// Recupera tutto il testo della slide attualmente visibile nel viewport.
 // Usato come fallback quando il gaze non punta a nessun textLayer.
-// Restituisce il testo della slide il cui wrapper è più al centro del viewport,
-// oppure stringa vuota se non trovato.
 function getVisibleSlideText() {
     const wrappers = Array.from(document.querySelectorAll('.pdf-slide-wrapper'));
     if (wrappers.length === 0) return "";
 
     const viewportMid = window.scrollY + window.innerHeight / 2;
 
-    // Trova il wrapper più vicino al centro del viewport
     let bestWrapper = null;
     let bestDist = Infinity;
     for (const w of wrappers) {
@@ -171,9 +159,8 @@ function getVisibleSlideText() {
 
     if (!bestWrapper) return "";
 
-    // Estrae tutto il testo dal textLayer di quella slide
     const textLayer = bestWrapper.querySelector('.textLayer');
-    if (!textLayer) return ""; // slide senza testo (solo immagine) → stringa vuota
+    if (!textLayer) return "";
 
     const text = Array.from(textLayer.children)
         .map(el => el.textContent.trim())
@@ -184,7 +171,7 @@ function getVisibleSlideText() {
     return text;
 }
 
-// ── NEW: controlla se la slide visibile è solo immagine (nessun textLayer con testo) ──
+// Controlla se la slide visibile è solo immagine (nessun textLayer con testo)
 function isVisibleSlideImageOnly() {
     const wrappers = Array.from(document.querySelectorAll('.pdf-slide-wrapper'));
     if (wrappers.length === 0) return false;
@@ -233,14 +220,9 @@ async function init() {
         isGazeCalibrating = false;
         gazeDot.style.display = 'block';
         // Salva l'IOD corrente come riferimento fisso per il depth correction.
-        // rawMetrics potrebbe non essere disponibile qui (siamo in callback),
-        // usiamo il valore della baseline emotiva se già calibrata, altrimenti
-        // il valore accumulato nei campioni gaze (mediana degli IOD raccolti).
         if (affectAnalyzer.isCalibrated && affectAnalyzer.baseline.iod > 0) {
             gazeBaseIod = affectAnalyzer.baseline.iod;
         } else if (gazeCalibrator.calibrationPoints.length > 0) {
-            // Fallback: median IOD dai punti di calibrazione gaze stessi
-            // (non disponibile direttamente, teniamo il default 0.20)
             gazeBaseIod = 0.20;
         }
         console.log(`[Gaze] gazeBaseIod fissato a ${gazeBaseIod.toFixed(4)}`);
@@ -263,12 +245,10 @@ async function init() {
             if (isAnsweringUser) return;
 
             // 5. Intervento proattivo: SOLO wake word può interrompere
-            //    (l'utente può dire "Aura, ho capito" per fermare l'intervento)
             if (isProactiveInterventionActive) {
                 if (final) {
                     const lower = final.trim().toLowerCase();
                     if (WAKE_WORD_RE.test(lower) && final.trim().length > 5) {
-                        // Interrompe l'intervento e gestisce la domanda
                         eca.currentAudio.pause();
                         isProactiveInterventionActive = false;
                         negativeStateStartTime = 0;
@@ -286,17 +266,15 @@ async function init() {
             if (userMicTimeout) clearTimeout(userMicTimeout);
 
             if (final) {
-                const text = final.trim();
+                const text  = final.trim();
                 const lower = text.toLowerCase();
                 currentFinalTranscript = text;
                 voiceDiv.innerHTML = `<span style="color:#0f172a;font-weight:600;">${text}</span>`;
 
-                // FIX wake word: word boundary regex, non substring
                 if (text.length > 5 && WAKE_WORD_RE.test(lower)) {
                     manageUserQuestion(text);
                 } else {
                     eca.setState('IDLE');
-                    // Feedback: l'utente ha parlato ma senza wake word
                     if (text.length > 3) {
                         voiceDiv.innerHTML += `<span style="font-size:0.75rem;color:#94a3b8;display:block;">
                             (Di' "Aura" per attivare l'assistente)</span>`;
@@ -314,8 +292,6 @@ async function init() {
         },
         // onStatusChange
         (statusMessage) => {
-            // VoiceInput manda solo errori critici (mic negato ecc.)
-            // Lo stato normale è gestito da updateMicStatusUI()
             if (statusMessage.startsWith("Errore")) {
                 const el = document.getElementById('voice-status');
                 if (el) { el.innerText = statusMessage; el.style.color = '#ef4444'; }
@@ -332,13 +308,11 @@ async function init() {
 
     if (gazeCalibrator.loadFromStorage?.()) gazeDot.style.display = 'block';
 
-    // Tenta di ricaricare la baseline emotiva da sessione precedente
     if (affectAnalyzer.loadBaselineFromStorage()) {
         document.getElementById('val-status').innerText = "Baseline caricata.";
         updateMicStatusUI();
     }
 
-    // Aggiorna la label mic ogni secondo (per far scadere lo stato anti-echo)
     setInterval(updateMicStatusUI, 1000);
 }
 
@@ -391,21 +365,21 @@ function drawFaceMeshSegments(landmarks) {
         indices.forEach((idx, i) => {
             const pt = landmarks[idx];
             if (i === 0) ctx.moveTo(pt.x * canvas.width, pt.y * canvas.height);
-            else ctx.lineTo(pt.x * canvas.width, pt.y * canvas.height);
+            else         ctx.lineTo(pt.x * canvas.width, pt.y * canvas.height);
         });
         if (close) ctx.closePath();
         ctx.stroke();
     };
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows, 'rgba(43,87,151,0.8)');
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye, 'rgba(0,180,0,0.8)', true);
-    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye, 'rgba(0,180,0,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.brows,     'rgba(43,87,151,0.8)');
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.leftEye,   'rgba(0,180,0,0.8)', true);
+    drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.rightEye,  'rgba(0,180,0,0.8)', true);
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.outerLips, 'rgba(185,29,71,0.8)', true);
     drawPath(FaceMetricsExtractor.RENDER_SEGMENTS.innerLips, 'rgba(185,29,71,0.8)', true);
 }
 
 function updateStatusCard(state) {
     const card = document.getElementById('card-status');
-    const val = document.getElementById('val-status');
+    const val  = document.getElementById('val-status');
     card.classList.remove('alert', 'warning', 'info');
     if (state.isInDifficulty) {
         card.classList.add('alert');
@@ -424,10 +398,10 @@ async function loop() {
         if (video.currentTime !== lastVideoTime) {
             const dtSec = Math.min((ts - lastFrameTimeMs) / 1000.0, 0.1);
             lastFrameTimeMs = ts;
-            lastVideoTime = video.currentTime;
+            lastVideoTime   = video.currentTime;
 
             eca.update(dtSec);
-            canvas.width = video.videoWidth;
+            canvas.width  = video.videoWidth;
             canvas.height = video.videoHeight;
 
             const results = faceLandmarker.detectForVideo(video, ts);
@@ -435,8 +409,8 @@ async function loop() {
             const hasFace = results.faceLandmarks?.length > 0;
             affectAnalyzer.updateFaceAbsent(!hasFace, Math.min((performance.now() - lastFrameTimeMs + 16) / 1000, 0.1));
 
-            if (hasFace) { // era: if (results.faceLandmarks?.length > 0)
-                const landmarks = results.faceLandmarks[0];
+            if (hasFace) {
+                const landmarks  = results.faceLandmarks[0];
                 drawFaceMeshSegments(landmarks);
 
                 const rawMetrics = FaceMetricsExtractor.extractRawMetrics(landmarks);
@@ -444,9 +418,8 @@ async function loop() {
 
                 currentNormalizedIris = gazeEstimator.getRobustGazeVector(landmarks);
 
-                // Multi-frame calibration
+                // Multi-frame gaze calibration
                 if (isCollectingGazeSample && currentNormalizedIris) {
-                    // FIX: salva valori depth-corrected, coerenti con predict()
                     const _dcCal = gazeBaseIod / rawMetrics.iod;
                     gazeSampleBuffer.push({ x: currentNormalizedIris.x * _dcCal, y: currentNormalizedIris.y * _dcCal });
                     calibrationUI.updateProgress(Math.min(gazeSampleBuffer.length / GAZE_SAMPLE_COUNT, 1));
@@ -471,7 +444,7 @@ async function loop() {
                         const smooth = uiFilter.filter(rawPos.x, rawPos.y, ts);
                         currentSmoothPos = smooth;
                         gazeDot.style.left = `${smooth.x}px`;
-                        gazeDot.style.top = `${smooth.y}px`;
+                        gazeDot.style.top  = `${smooth.y}px`;
                         if (rawPos.confidence !== undefined)
                             gazeDot.style.opacity = (0.4 + 0.6 * rawPos.confidence).toFixed(2);
                         document.getElementById('val-gaze').innerText =
@@ -506,8 +479,8 @@ async function loop() {
 
                     document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                     document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
+
                     // Gaze-away: notifica all'analyzer quando il contesto non è fresco
-                    // e il pdf è caricato (proxy: utente sta guardando altrove)
                     if (isPdfLoaded && _getFreshGazeContext().length === 0 && lastGazedTextTimestamp > 0) {
                         affectAnalyzer.notifyGazeAway();
                     }
@@ -522,19 +495,19 @@ async function loop() {
                             const actives = state.activeExpressions;
                             const z = state.rawZ;
                             const fmt = (name, label, signal, zVal, me_active) => {
-                                const dot = me_active ? '●' : (signal ? '◐' : '○');
-                                const col = me_active ? '#ef4444' : (signal ? '#f59e0b' : '#94a3b8');
+                                const dot  = me_active ? '●' : (signal ? '◐' : '○');
+                                const col  = me_active ? '#ef4444' : (signal ? '#f59e0b' : '#94a3b8');
                                 const bold = me_active ? 'font-weight:700;' : '';
                                 return `<span style="color:${col};${bold}">${dot} ${label}: ${zVal.toFixed(2)}σ</span>`;
                             };
                             el.innerHTML = [
-                                fmt('browFurrow', 'AU4 Fronte', me.browFurrow, z.zCorrugator, actives.includes('browFurrow')),
-                                fmt('eyeSquint', 'EAR Occhi', me.eyeSquint, z.zEar, actives.includes('eyeSquint')),
-                                fmt('mouthFrown', 'Bocca giù', me.mouthFrown, z.zMouthCurvature, actives.includes('mouthFrown')),
-                                fmt('lipPress', 'Labbra prem.', me.lipPress, z.zLipPress, actives.includes('lipPress')),
-                                fmt('noseWrinkle', 'Naso AU9', me.noseWrinkle, z.zNoseWrinkle, actives.includes('noseWrinkle')),
-                                fmt('browRaise', 'AU1 Sopr.', me.browRaise, z.zBrowRaise, actives.includes('browRaise')),
-                                fmt('mouthOpen', 'Bocca aperta', me.mouthOpen, z.zMouthOpen, actives.includes('mouthOpen')),
+                                fmt('browFurrow',  'AU4 Fronte',   me.browFurrow,  z.zCorrugator,    actives.includes('browFurrow')),
+                                fmt('eyeSquint',   'EAR Occhi',    me.eyeSquint,   z.zEar,           actives.includes('eyeSquint')),
+                                fmt('mouthFrown',  'Bocca giù',    me.mouthFrown,  z.zMouthCurvature, actives.includes('mouthFrown')),
+                                fmt('lipPress',    'Labbra prem.', me.lipPress,    z.zLipPress,      actives.includes('lipPress')),
+                                fmt('noseWrinkle', 'Naso AU9',     me.noseWrinkle, z.zNoseWrinkle,   actives.includes('noseWrinkle')),
+                                fmt('browRaise',   'AU1 Sopr.',    me.browRaise,   z.zBrowRaise,     actives.includes('browRaise')),
+                                fmt('mouthOpen',   'Bocca aperta', me.mouthOpen,   z.zMouthOpen,     actives.includes('mouthOpen')),
                             ].join('<br>');
                         }
                     }
@@ -547,7 +520,7 @@ async function loop() {
                         negativeStateStartTime = ts;
                     }
 
-                    const negativeMs = negativeStateStartTime > 0 ? ts - negativeStateStartTime : 0;
+                    const negativeMs   = negativeStateStartTime > 0 ? ts - negativeStateStartTime : 0;
                     const isPersistent = negativeMs >= NEGATIVE_STATE_PERSIST_MS;
                     const canIntervene = !firstInterventionDone || (ts - lastProactiveIntervention) > PROACTIVE_COOLDOWN_MS;
 
@@ -559,7 +532,7 @@ async function loop() {
                         negativeStateStartTime = 0;
                         eca.setState('THINKING');
 
-                        // ── NEW: logica a 3 casi per il contesto dell'intervento proattivo ──
+                        // Logica a 3 casi per il contesto dell'intervento proattivo
                         const gazeCtx = _getFreshGazeContext();
                         const exprList = state.activeExpressions.join(', ') || 'espressione di difficoltà';
                         let prompt;
@@ -581,12 +554,10 @@ async function loop() {
                                 console.log(`[AURA] Caso B — testo intera slide: "${slideText.substring(0, 60)}..."`);
                                 prompt = `L'utente mostra ${exprList}. Non riesco a rilevare esattamente dove stia guardando, ma la slide che sta visualizzando contiene questo testo:\n"${slideText}"\nFormula una domanda diretta e breve (massimo 15 parole) per capire se ha difficoltà con quel contenuto.`;
                             } else {
-                                // Fallback: slide senza testo rilevabile (raro, safety net)
                                 console.log(`[AURA] Fallback — nessun testo rilevabile`);
                                 prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.`;
                             }
                         }
-                        // ── END NEW ──
 
                         fetchLLMResponse(prompt).then(phrase => {
                             addChatMessage('ai', phrase);
@@ -598,24 +569,27 @@ async function loop() {
                         });
                     }
 
+                    // CSV: salvataggio dati di sessione (nomi campi allineati al nuovo AffectAnalyzer)
                     if (gazeCalibrator.regressionModel) {
                         sessionData.push({
-                            timestamp: ts.toFixed(2), dtSec: dtSec.toFixed(4),
+                            timestamp: ts.toFixed(2),
+                            dtSec: dtSec.toFixed(4),
                             rawGazeX: currentNormalizedIris?.x.toFixed(5) ?? "0",
                             rawGazeY: currentNormalizedIris?.y.toFixed(5) ?? "0",
                             smoothGazeX: currentSmoothPos.x.toFixed(2),
                             smoothGazeY: currentSmoothPos.y.toFixed(2),
                             iod: rawMetrics.iod.toFixed(4),
-                            zAU4: state.zCorrugator?.toFixed(2) ?? "0",
-                            zEar: state.zEar?.toFixed(2) ?? "0",
-                            zLip: state.zLip?.toFixed(2) ?? "0",          // ← era senza ?.
-                            zAU1: state.zInnerBrowRaise?.toFixed(2) ?? "0", // ← era senza ?.
-                            zAU9: state.zNoseWrinkle?.toFixed(2) ?? "0",
-                            blinkRate: state.blinkRate?.toFixed(3) ?? "0",
+                            zCorrugator:    state.zCorrugator.toFixed(2),
+                            zEar:           state.zEar.toFixed(2),
+                            zLipPress:      state.zLipPress.toFixed(2),
+                            zMouthOpen:     state.zMouthOpen.toFixed(2),
+                            zMouthCurvature: state.zMouthCurvature.toFixed(2),
+                            zNoseWrinkle:   state.zNoseWrinkle.toFixed(2),
+                            zBrowRaise:     state.zBrowRaise.toFixed(2),
+                            blinkRate:      state.blinkRate.toFixed(3),
                             isInDifficulty: state.isInDifficulty ? 1 : 0,
                             activeExpressions: state.activeExpressions.join(';'),
                             gazeAwayCount: state.gazeAwayCount,
-                            isSpeaking: state.isSpeaking ? 1 : 0,
                             gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
                             emotionState: currentEmotionState,
                             spokenText: currentFinalTranscript
@@ -625,8 +599,6 @@ async function loop() {
             }
         }
     } catch (err) {
-        // Un errore nel loop non deve mai fermare il rendering.
-        // Logghiamo e riprendiamo nel prossimo frame.
         console.error('[loop] Errore non gestito:', err);
     } finally {
         requestAnimationFrame(loop);
@@ -636,18 +608,18 @@ async function loop() {
 // ── DOMContentLoaded ───────────────────────────────────────────────────────
 
 document.addEventListener("DOMContentLoaded", () => {
-    video = document.getElementById('webcam');
-    canvas = document.getElementById('output-canvas');
-    ctx = canvas.getContext('2d');
-    gazeDot = document.getElementById('gaze-dot');
-    btnCalGaze = document.getElementById('btn-cal-gaze');
+    video         = document.getElementById('webcam');
+    canvas        = document.getElementById('output-canvas');
+    ctx           = canvas.getContext('2d');
+    gazeDot       = document.getElementById('gaze-dot');
+    btnCalGaze    = document.getElementById('btn-cal-gaze');
     btnCalEmotion = document.getElementById('btn-cal-emotion');
-    calOverlay = document.getElementById('cal-overlay');
+    calOverlay    = document.getElementById('cal-overlay');
 
     btnCalGaze.onclick = () => {
         btnCalGaze.blur();
         gazeCalibrator.reset(); uiFilter.reset();
-        gazeBaseIod = 0.20; // reset: verrà risettato al completamento
+        gazeBaseIod = 0.20;
         isGazeCalibrating = true;
         isCollectingGazeSample = false; gazeSampleBuffer = [];
         calibrationUI.start();
@@ -669,13 +641,11 @@ document.addEventListener("DOMContentLoaded", () => {
         e.preventDefault();
         if (e.repeat) return;
 
-        // Fase intro: SPAZIO avvia la calibrazione vera
         if (calibrationUI._phase === 'intro') {
             calibrationUI.onSpaceDown();
             return;
         }
 
-        // Fase dots: avvia raccolta multi-frame
         if (!isCollectingGazeSample && currentNormalizedIris) {
             isCollectingGazeSample = true; gazeSampleBuffer = [];
             calibrationUI.updateProgress(0);
@@ -728,16 +698,16 @@ document.addEventListener("DOMContentLoaded", () => {
         if (cc) cc.style.display = 'none';
     });
 
-    const dropZone = document.getElementById('pdf-drop-zone');
-    const inputPdf = document.getElementById('input-pdf');
+    const dropZone        = document.getElementById('pdf-drop-zone');
+    const inputPdf        = document.getElementById('input-pdf');
     const slidesContainer = document.getElementById('slides-container');
-    const pdfSpinner = document.getElementById('pdf-loading-spinner');
+    const pdfSpinner      = document.getElementById('pdf-loading-spinner');
 
     if (dropZone && inputPdf && slidesContainer) {
-        dropZone.onclick = () => inputPdf.click();
+        dropZone.onclick    = () => inputPdf.click();
         dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('dragover'); };
-        dropZone.ondrop = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
-        inputPdf.onchange = (e) => handlePdfUpload(e.target.files[0]);
+        dropZone.ondrop     = (e) => { e.preventDefault(); handlePdfUpload(e.dataTransfer.files[0]); };
+        inputPdf.onchange   = (e) => handlePdfUpload(e.target.files[0]);
     }
 
     async function handlePdfUpload(file) {
@@ -751,9 +721,9 @@ document.addEventListener("DOMContentLoaded", () => {
         isPdfLoaded = false;
         currentGazedText = ""; lastGazedTextTimestamp = 0; _lastExtractedSnippet = "";
 
-        if (dropZone) dropZone.style.display = 'none';
+        if (dropZone)        dropZone.style.display = 'none';
         if (slidesContainer) slidesContainer.style.display = 'none';
-        if (pdfSpinner) pdfSpinner.style.display = 'block';
+        if (pdfSpinner)      pdfSpinner.style.display = 'block';
 
         const auraPromise = speakECA("Sto analizzando le slide, preparo il livello semantico.");
 
@@ -775,7 +745,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 let totalTextItems = 0;
 
                 for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-                    const page = await pdf.getPage(pageNum);
+                    const page     = await pdf.getPage(pageNum);
                     const viewport = page.getViewport({ scale: 1.5 });
 
                     const pageWrapper = document.createElement('div');
@@ -858,7 +828,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!element.parentNode?.classList?.contains('textLayer')) return;
 
         const siblings = Array.from(element.parentNode.children);
-        const index = siblings.indexOf(element);
+        const index    = siblings.indexOf(element);
         if (index === -1) return;
 
         const snippet = siblings
@@ -870,7 +840,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (_snippetChangedSignificantly(snippet, _lastExtractedSnippet)) {
             currentGazedText = snippet;
             _lastExtractedSnippet = snippet;
-            console.log(`[GAZE] Testo rilevato: "${snippet.substring(0, 80)}..."`); // ← aggiunta
+            console.log(`[GAZE] Testo rilevato: "${snippet.substring(0, 80)}..."`);
         }
         lastGazedTextTimestamp = performance.now();
     }
