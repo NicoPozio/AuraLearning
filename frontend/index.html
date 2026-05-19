@@ -6,19 +6,35 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Aura MVP - Controller Sensoriale Avanzato</title>
 
+    <!-- PDF.js library: used to render uploaded PDF slide decks inside the study area -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
     <style>
+        /* =====================================================
+           DESIGN TOKENS
+           Centralised colour palette used throughout the UI.
+           Changing a value here propagates to every component.
+           ===================================================== */
         :root {
             --primary: #2b5797;
+            /* Main brand colour (buttons, borders, AI bubbles)        */
             --secondary: #8b5cf6;
+            /* Accent for PDF workspace and chat container             */
             --error: #b91d47;
+            /* Alert state (e.g. frustration detected, gaze dot)       */
             --warning: #f59e0b;
+            /* Soft warning state                                      */
             --info: #3b82f6;
+            /* Informational highlight                                 */
             --bg: #f4f6f9;
+            /* Page background                                         */
             --surface: #ffffff;
+            /* Card / panel background                                 */
         }
 
+        /* =====================================================
+           BASE LAYOUT
+           ===================================================== */
         body {
             font-family: 'Segoe UI', system-ui, sans-serif;
             background: var(--bg);
@@ -27,6 +43,7 @@
             color: #1e293b;
         }
 
+        /* Two-column dashboard: main workspace on the left, telemetry sidebar on the right */
         .dashboard-layout {
             display: flex;
             gap: 24px;
@@ -35,6 +52,7 @@
             align-items: flex-start;
         }
 
+        /* Left column: holds either the webcam feed or the PDF study area */
         .main-panel {
             flex: 2;
             background: var(--surface);
@@ -43,6 +61,7 @@
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
         }
 
+        /* Right column: ECA avatar, chat, and live metric cards */
         .sidebar {
             flex: 1;
             display: flex;
@@ -51,6 +70,9 @@
             min-width: 350px;
         }
 
+        /* =====================================================
+           HEADER CONTROLS (calibration buttons, PDF toggle, etc.)
+           ===================================================== */
         .header-controls {
             display: flex;
             flex-wrap: wrap;
@@ -73,6 +95,11 @@
             opacity: 0.9;
         }
 
+        /* =====================================================
+           WORKSPACE — webcam OR PDF
+           Only one of #video-wrapper / #pdf-wrapper is visible
+           at any given time, toggled by main.js.
+           ===================================================== */
         .workspace-container {
             position: relative;
             width: 100%;
@@ -81,6 +108,7 @@
             overflow: hidden;
         }
 
+        /* Webcam container — fixed 4:3 aspect ratio matches MediaPipe's expected input */
         .video-container {
             width: 100%;
             background: #000;
@@ -88,6 +116,8 @@
             aspect-ratio: 4/3;
         }
 
+        /* The video element itself: mirrored horizontally (scaleX -1) so the user
+           sees themselves as in a mirror, which is the natural UX expectation */
         video {
             width: 100%;
             height: 100%;
@@ -95,6 +125,8 @@
             transform: scaleX(-1);
         }
 
+        /* Overlay canvas for landmark / gaze visualisation.
+           Mirrored to stay aligned with the mirrored video underneath. */
         canvas#output-canvas {
             position: absolute;
             top: 0;
@@ -105,6 +137,9 @@
             pointer-events: none;
         }
 
+        /* =====================================================
+           PDF STUDY AREA
+           ===================================================== */
         #pdf-wrapper {
             display: none;
             width: 100%;
@@ -114,9 +149,10 @@
             padding: 20px;
             box-sizing: border-box;
             position: relative;
-            /* ← necessario per lo spinner PDF assoluto */
+            /* Required so the absolutely-positioned loading spinner anchors here */
         }
 
+        /* Drop zone shown when no PDF is loaded yet */
         #pdf-drop-zone {
             border: 3px dashed #cbd5e1;
             border-radius: 12px;
@@ -134,7 +170,8 @@
             background: #f1f5f9;
         }
 
-        /* Spinner PDF — centrato dentro pdf-wrapper, sopra le slide */
+        /* Loading spinner shown while PDF pages are being rasterised.
+           Sticky positioning keeps it visible above the slide stream during scroll. */
         #pdf-loading-spinner {
             display: none;
             position: sticky;
@@ -158,6 +195,8 @@
             font-size: 0.9rem;
         }
 
+        /* Each rendered slide is a centred image with a subtle shadow,
+           so the user perceives them as physical pages */
         .pdf-slide {
             display: block;
             margin: 0 auto 30px auto;
@@ -166,6 +205,12 @@
             border: 1px solid #e2e8f0;
         }
 
+        /* =====================================================
+           SIDEBAR DATA CARDS
+           Each card displays one live metric and can take three
+           emphasis levels (alert / warning / info) by adding a
+           modifier class.
+           ===================================================== */
         .data-card {
             background: var(--surface);
             padding: 16px;
@@ -190,6 +235,7 @@
             background-color: #eff6ff;
         }
 
+        /* Card title (small caps style) */
         .data-title {
             font-size: 0.85rem;
             text-transform: uppercase;
@@ -199,12 +245,16 @@
             font-weight: 700;
         }
 
+        /* Numeric value rendered in monospace for stable alignment between updates */
         .data-value {
             font-size: 1.25rem;
             font-family: monospace;
             font-weight: 600;
         }
 
+        /* =====================================================
+           CHAT BUBBLES
+           ===================================================== */
         .chat-message {
             padding: 10px;
             border-radius: 8px;
@@ -213,6 +263,7 @@
             line-height: 1.4;
         }
 
+        /* User message: light bubble, right-aligned, flat bottom-right corner */
         .msg-user {
             background: #e2e8f0;
             color: #1e293b;
@@ -220,6 +271,7 @@
             border-bottom-right-radius: 0;
         }
 
+        /* AI message: brand-coloured bubble, left-aligned, flat bottom-left corner */
         .msg-ai {
             background: var(--primary);
             color: white;
@@ -227,6 +279,12 @@
             border-bottom-left-radius: 0;
         }
 
+        /* =====================================================
+           GAZE DOT
+           Fixed-positioned red dot rendered on top of everything,
+           moved by main.js to reflect the user's current gaze
+           coordinate in screen pixels.
+           ===================================================== */
         #gaze-dot {
             position: fixed;
             width: 12px;
@@ -238,8 +296,10 @@
             z-index: 10000;
             display: none;
             transform: translate(-50%, -50%);
+            /* centre the dot on its (x, y) */
         }
 
+        /* Calibration text overlay shown over the webcam during baseline acquisition */
         .calibration-overlay {
             position: absolute;
             top: 10px;
@@ -253,7 +313,11 @@
             z-index: 10;
         }
 
-        /* Spinner ECA (nella sidebar) */
+        /* =====================================================
+           SPINNERS
+           ===================================================== */
+
+        /* Small spinner used inside the ECA card for the THINKING state */
         .spinner {
             width: 32px;
             height: 32px;
@@ -263,7 +327,7 @@
             animation: spin 1s linear infinite;
         }
 
-        /* Spinner PDF (più grande) */
+        /* Larger spinner used for PDF rendering */
         .spinner-lg {
             width: 48px;
             height: 48px;
@@ -274,6 +338,13 @@
             margin: 0 auto;
         }
 
+        /* =====================================================
+           PDF.js TEXT LAYER
+           PDF.js renders an invisible text layer on top of each
+           rasterised page so that the underlying words can be
+           selected, copied and — crucially for Aura —
+           identified by gaze position (deixis resolution).
+           ===================================================== */
         .textLayer {
             position: absolute;
             left: 0;
@@ -282,7 +353,7 @@
             bottom: 0;
             overflow: hidden;
             opacity: 0;
-            /* Mantiene il testo invisibile ma tracciabile dal mouse/gaze */
+            /* Text stays invisible but is still hit-testable by the mouse / gaze coordinate */
             line-height: 1.0;
         }
 
@@ -294,6 +365,7 @@
             transform-origin: 0% 0%;
         }
 
+        /* Shared rotation keyframes for both spinners */
         @keyframes spin {
             to {
                 transform: rotate(360deg);
@@ -303,35 +375,49 @@
 </head>
 
 <body>
+    <!-- Floating gaze cursor: position is updated by main.js every frame -->
     <div id="gaze-dot"></div>
 
     <div class="dashboard-layout">
+
+        <!-- ===============================================================
+             MAIN PANEL — workspace (webcam OR PDF) + top control bar
+             =============================================================== -->
         <div class="main-panel">
+
+            <!-- Control bar: calibration flow, CSV export, view switching -->
             <div class="header-controls">
                 <button id="btn-cal-gaze">1. Calibrazione Sguardo</button>
                 <button id="btn-cal-emotion">2. Calibrazione Emotiva</button>
                 <button id="btn-export" style="background: #10b981;">3. Dati (CSV)</button>
                 <button id="btn-show-pdf" style="background: var(--secondary);">4. Area Studio (PDF)</button>
                 <button id="btn-show-cam" style="background: #64748b; display: none;">Torna alla Webcam</button>
+                <!-- Hidden file picker triggered programmatically when the user clicks the drop zone -->
                 <input type="file" id="input-pdf" accept="application/pdf" style="display: none;" />
             </div>
 
+            <!-- Workspace: exactly one of the two children below is visible at a time -->
             <div class="workspace-container">
+
+                <!-- ===== Webcam view (default) ===== -->
                 <div id="video-wrapper" class="video-container">
                     <video id="webcam" autoplay playsinline></video>
                     <canvas id="output-canvas"></canvas>
+                    <!-- Overlay shown only during the 120-frame baseline acquisition -->
                     <div id="cal-overlay" class="calibration-overlay">
                         Acquisizione Baseline... Mantenere espressione neutra.
                     </div>
                 </div>
 
+                <!-- ===== PDF study view ===== -->
                 <div id="pdf-wrapper">
-                    <!-- SPINNER PDF: visibile durante il caricamento delle slide -->
+                    <!-- Loading indicator shown while the PDF is being rasterised page-by-page -->
                     <div id="pdf-loading-spinner">
                         <div class="spinner-lg"></div>
                         <p>Caricamento slide in corso...</p>
                     </div>
 
+                    <!-- Initial drop zone (visible until the first PDF is loaded) -->
                     <div id="pdf-drop-zone">
                         <svg width="64" height="64" fill="#94a3b8" viewBox="0 0 24 24" style="margin-bottom: 15px;">
                             <path
@@ -340,27 +426,34 @@
                         <h2 style="color: #334155; margin: 0 0 10px 0;">Trascina qui le tue Slide (PDF)</h2>
                         <p style="color: #64748b; margin: 0;">Oppure clicca per esplorare i file</p>
                     </div>
+
+                    <!-- Container populated by main.js with one <img> + textLayer per page -->
                     <div id="slides-container" style="display: none; text-align: center;"></div>
                 </div>
             </div>
         </div>
 
+        <!-- ===============================================================
+             SIDEBAR — ECA avatar, chat, and live telemetry cards
+             =============================================================== -->
         <div class="sidebar">
-            <!-- ECA -->
+
+            <!-- ECA card: holds the Three.js avatar plus a status badge and a thinking spinner -->
             <div class="data-card" style="padding: 0; overflow: hidden; height: 300px; position: relative;">
                 <div id="eca-container" style="width: 100%; height: 100%; background: #e2e8f0;"></div>
+                <!-- Status badge: reflects the ECA state machine (IDLE / LISTENING / THINKING / SPEAKING) -->
                 <div id="eca-status"
                     style="position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,0.6); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; z-index: 10;">
                     ECA Offline
                 </div>
-                <!-- Spinner ECA: solo per stato THINKING dell'ECA -->
+                <!-- Visible only while the backend is generating a response (THINKING state) -->
                 <div id="thinking-spinner"
                     style="display: none; position: absolute; top: 15px; right: 15px; z-index: 10;">
                     <div class="spinner"></div>
                 </div>
             </div>
 
-            <!-- CHAT -->
+            <!-- Conversation history with Aura; hidden until the first exchange happens -->
             <div class="data-card" id="chat-container"
                 style="display: none; border-left-color: var(--secondary); height: 350px; flex-direction: column;">
                 <div class="data-title">Conversazione con Aura</div>
@@ -369,13 +462,14 @@
                 </div>
             </div>
 
-            <!-- METRICHE -->
+            <!-- Top-level affective state label (e.g. "Normal", "In difficoltà (browFurrow, lipPress)") -->
             <div class="data-card metric-card" id="card-status">
                 <div class="data-title">Stato Studente</div>
                 <div class="data-value" id="val-status" style="font-size: 1.1rem;">In attesa di calibrazione...</div>
             </div>
 
-            <!-- DEBUG: segnali microespressioni in tempo reale -->
+            <!-- Debug card: live readout of each individual micro-expression signal
+                 (● = above threshold / active, ○ = below threshold / inactive) -->
             <div class="data-card metric-card" id="card-debug" style="border-left-color:#94a3b8;">
                 <div class="data-title" style="display:flex;justify-content:space-between;">
                     <span>Segnali ME (debug)</span>
@@ -386,6 +480,7 @@
                 </div>
             </div>
 
+            <!-- Speech-to-text status + last transcribed utterance -->
             <div class="data-card metric-card" style="border-left-color: #8b5cf6;">
                 <div class="data-title" style="display: flex; justify-content: space-between;">
                     <span>Input Vocale (STT)</span>
@@ -397,6 +492,7 @@
                 </div>
             </div>
 
+            <!-- Individual Z-Score readouts and gaze coordinates (final on-screen pixels) -->
             <div class="data-card metric-card">
                 <div class="data-title">Tensione Corrugatore (AU4)</div>
                 <div class="data-value" id="val-au4">0.00 σ</div>
@@ -413,7 +509,15 @@
         </div>
     </div>
 
+    <!-- =====================================================
+         EXTERNAL SCRIPTS
+         ===================================================== -->
+
+    <!-- fflate: zlib-compatible compression, used by PDF.js for compressed PDF streams -->
     <script src="https://unpkg.com/fflate@0.8.2/umd/index.js"></script>
+
+    <!-- Import map: resolves bare module specifiers used by main.js
+         (MediaPipe vision tasks, Three.js core, and the Three.js addons folder). -->
     <script type="importmap">
         {
             "imports": {
@@ -423,6 +527,9 @@
             }
         }
     </script>
+
+    <!-- Application entry point: orchestrates the gaze pipeline, the affect analyser,
+         the ECA controller, and all UI bindings declared above. -->
     <script type="module" src="./src/main.js"></script>
 </body>
 

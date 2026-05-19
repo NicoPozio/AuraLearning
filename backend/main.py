@@ -10,12 +10,12 @@ import os
 import io
 from dotenv import load_dotenv
 
-# Caricamento sicuro delle variabili d'ambiente
+# Safely load environment variables from the .env file
 load_dotenv()
 
 app = FastAPI(title="Aura Proxy Backend")
 
-# Configurazione rigorosa del CORS per permettere le chiamate dal frontend Web
+# Strict CORS configuration to allow cross-origin requests from the web frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,28 +24,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inizializzazione LLM
+# Initialize the LLM (Large Language Model) client
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 if not LLM_API_KEY:
     raise RuntimeError("LLM_API_KEY mancante nel file .env")
 llm_client = AsyncGroq(api_key=LLM_API_KEY)
 
+# Initialize ElevenLabs API Key and specific Voice ID for Text-to-Speech
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-VOICE_ID = "N2lVS1w4EtoT3dr4eOWO"  # Voce di Callum
+VOICE_ID = "N2lVS1w4EtoT3dr4eOWO"  # Callum's voice ID
 
 # --- DATA MODELS ---
 
-# Singolo messaggio della chat history inviato dal frontend
+# Represents a single message in the chat history sent by the frontend
 class ChatMessage(BaseModel):
-    role: str                          # "user" | "model"
-    parts: List[dict]                  # [{"text": "..."}]
+    role: str                          # Either "user" or "model"
+    parts: List[dict]                  # E.g., [{"text": "..."}]
 
+# Payload structure for the chat request
 class ChatRequest(BaseModel):
     user_text: str
     emotion_state: str
     slide_context: str
-    chat_history: Optional[List[ChatMessage]] = []   # ultime 10 chat
+    chat_history: Optional[List[ChatMessage]] = []   # Last 10 chat messages
 
+# Payload structure for the Text-to-Speech request
 class TTSRequest(BaseModel):
     text: str
 
@@ -53,11 +56,12 @@ class TTSRequest(BaseModel):
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
+        # Inject slide context if provided by the frontend
         context_injection = ""
         if request.slide_context:
             context_injection = f"Ecco il testo delle slide:\n{request.slide_context}\n"
 
-        # Costruzione del System Prompt
+        # Construct the System Prompt guiding the AI tutor's behavior
         system_prompt = f"""Sei Aura, un tutor didattico virtuale.
             L'utente sembra: {request.emotion_state}.
             {context_injection}
@@ -67,9 +71,9 @@ async def chat_endpoint(request: ChatRequest):
             3. Sii concisa (max 3 frasi).
             4. Solo testo semplice. ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare Markdown, vietati gli asterischi, vietati i simboli matematici speciali. Scrivi tutto a parole in italiano."""
 
-        # Costruzione dei messaggi: system + history + messaggio corrente
-        # La chat_history arriva con role "user"/"model" (formato Gemini),
-        # convertiamo "model" → "assistant" per Groq/OpenAI.
+        # Build the messages array: system prompt + chat history + current user message
+        # The frontend sends history using Gemini's role format ("user"/"model").
+        # We map "model" to "assistant" to make it compatible with Groq/OpenAI APIs.
         messages = [{"role": "system", "content": system_prompt}]
 
         for msg in (request.chat_history or []):
@@ -78,38 +82,42 @@ async def chat_endpoint(request: ChatRequest):
             if text_content.strip():
                 messages.append({"role": groq_role, "content": text_content})
 
-        # Aggiunge il messaggio corrente dell'utente
+        # Append the current message from the user
         messages.append({"role": "user", "content": request.user_text})
 
-        # Chiamata asincrona a LLaMA 3
+        # Asynchronous call to the LLaMA 3 model via Groq
         response = await llm_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.7,
-            max_tokens=150  # Manteniamo la risposta concisa
+            max_tokens=150  # Keep the response short and concise
         )
 
-        # Estrazione del testo generato
+        # Extract and return the generated text
         answer = response.choices[0].message.content.strip()
         return {"text": answer}
 
     except Exception as e:
-        # Stampa l'errore vero nel terminale per il debug
+        # Print the actual stack trace in the terminal for debugging purposes
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Errore LLM: {str(e)}")
 
 @app.post("/api/tts")
 async def tts_endpoint(request: TTSRequest):
+    # Validate that the ElevenLabs API key is present
     if not ELEVENLABS_API_KEY:
         raise HTTPException(status_code=500, detail="ElevenLabs API Key mancante nel server.")
 
+    # Prepare the ElevenLabs API request URL and headers
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?optimize_streaming_latency=3"
     headers = {
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
         "xi-api-key": ELEVENLABS_API_KEY
     }
+    
+    # Prepare the TTS payload using the requested text and a specific multilingual model
     payload = {
         "text": request.text,
         "model_id": "eleven_multilingual_v2",
@@ -119,16 +127,21 @@ async def tts_endpoint(request: TTSRequest):
         }
     }
 
+    # Make an asynchronous HTTP POST request to ElevenLabs
     async with httpx.AsyncClient() as client:
         response = await client.post(url, headers=headers, json=payload, timeout=30.0)
 
+    # Handle potential errors from the TTS provider
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail="Errore dal provider TTS")
 
+    # Return the generated audio as a streaming response
     return StreamingResponse(io.BytesIO(response.content), media_type="audio/mpeg")
 
+# Mount the frontend directory to serve static HTML/JS/CSS files at the root URL
 app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
 
+# Entry point to run the application using uvicorn
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
