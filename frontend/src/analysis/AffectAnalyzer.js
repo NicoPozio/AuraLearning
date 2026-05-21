@@ -68,7 +68,7 @@ export class AffectAnalyzer {
             mouthOpen: { zThresh: 1.5, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthFrown: { zThresh: 1.0, durationMs: 1500, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
             noseWrinkle: { zThresh: 1.0, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
-            browRaise: { zThresh: 1.0, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
+            browRaise: { zThresh: 1.5, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
             faceAbsent: { zThresh: 0, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
         };
 
@@ -88,11 +88,7 @@ export class AffectAnalyzer {
         this.isInDifficulty = false;
         this.activeExpressions = []; // names of currently active MEs (debug / log / prompt)
 
-        // ── Gaze-away (frequency-based) ──────────────────────────────────
-        this._GAZE_AWAY_WINDOW_MS = 30000;
-        this._GAZE_AWAY_COUNT = 4;     // N events inside the window → active
-        this._gazeAwayTimestamps = [];
-        this._gazeAwayActive = false;
+
 
         // ── Per-frame EMA smoothing on the raw metrics ──────────────────
         // Tames single-frame outliers from MediaPipe before they reach the
@@ -192,15 +188,14 @@ export class AffectAnalyzer {
 
             // Per-metric minimum sigma values chosen empirically so that a
             // single-frame muscle twitch maps to roughly a 1σ z-score
-            this.baseline.corrugator = stat('corrugator', 0.008);
-            this.baseline.ear = stat('ear', 0.020);
-            this.baseline.lipPress = stat('lipPress', 0.010);
-            this.baseline.mouthOpen = stat('mouthOpen', 0.015);
-            this.baseline.mouthCurvature = stat('mouthCurvature', 0.010);
-            this.baseline.noseWrinkle = stat('noseWrinkle', 0.008);
-            this.baseline.innerBrowRaise = stat('innerBrowRaise', 0.010);
-            this.baseline.smileIntensity = stat('smileIntensity', 0.010);
-
+            this.baseline.corrugator = stat('corrugator', 0.020);
+            this.baseline.ear = stat('ear', 0.060);                   // Alzato tantissimo (ignora i battiti di ciglia lenti)
+            this.baseline.lipPress = stat('lipPress', 0.025);
+            this.baseline.mouthOpen = stat('mouthOpen', 0.030);
+            this.baseline.mouthCurvature = stat('mouthCurvature', 0.050); // Alzato tantissimo (ignora i cambi di postura del collo)
+            this.baseline.noseWrinkle = stat('noseWrinkle', 0.035);   // Alzato 
+            this.baseline.innerBrowRaise = stat('innerBrowRaise', 0.050); // Alzato tantissimo (ignora se abbassi il mento)
+            this.baseline.smileIntensity = stat('smileIntensity', 0.040);
             this.isCalibrating = false;
             this.isCalibrated = true;
             // Persist the baseline so a page refresh doesn't force the user to recalibrate
@@ -257,19 +252,7 @@ export class AffectAnalyzer {
      * reaches GAZE_AWAY_COUNT inside the window. Called by main.js
      * whenever the live gaze context goes stale.
      */
-    notifyGazeAway() {
-        const now = performance.now();
-        this._gazeAwayTimestamps.push(now);
-        // Drop events that fell outside the current window
-        const cutoff = now - this._GAZE_AWAY_WINDOW_MS;
-        this._gazeAwayTimestamps = this._gazeAwayTimestamps.filter(t => t > cutoff);
-        const wasActive = this._gazeAwayActive;
-        this._gazeAwayActive = this._gazeAwayTimestamps.length >= this._GAZE_AWAY_COUNT;
-        // Log only the rising edge to keep the trace clean
-        if (this._gazeAwayActive && !wasActive) {
-            this.log(`Gaze-away: ${this._gazeAwayTimestamps.length} volte in ${(this._GAZE_AWAY_WINDOW_MS / 1000)}s`, 'ALERT');
-        }
-    }
+
 
     // ── Update ────────────────────────────────────────────────────────────
 
@@ -329,7 +312,7 @@ export class AffectAnalyzer {
         //     z-score always means "muscle activated".
         const zCorrugator = -z('corrugator');       // negated: baseline > sample = brow furrowed
         const zEar = -z('ear');              // negated: baseline > sample = eye squinted
-        const zLipPress = -z('lipPress');         // negated: baseline > sample = lips pressed
+        const zLipPress = z('lipPress');         // pos: baseline < sample = lips pressed
         const zMouthOpen = z('mouthOpen');        // positive: mouth more open than baseline
         const zNoseWrinkle = z('noseWrinkle');      // positive: nose more wrinkled
         const zBrowRaise = z('innerBrowRaise');   // positive: inner brow raised
@@ -393,9 +376,7 @@ export class AffectAnalyzer {
         this.activeExpressions = Object.entries(this._MEs)
             .filter(([, me]) => me.active)
             .map(([name]) => name);
-        // Gaze-away is independent from the per-ME machine but contributes
-        // to the same overall "in difficulty" decision
-        if (this._gazeAwayActive) this.activeExpressions.push('gazeAway');
+
 
         const anyActive = this.activeExpressions.length > 0; // includes mouthFrown and gazeAway
 

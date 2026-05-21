@@ -339,7 +339,8 @@ export class ECAController {
      * @returns {Promise<void>} Resolves when the simulated playback ends.
      */
     async speak(text) {
-        // --- INIZIO VERSIONE MUTATA (RISPARMIO CREDITI) ---
+        /**
+         * // --- INIZIO VERSIONE MUTATA (RISPARMIO CREDITI) ---
         console.log(`🔇 [AURA MUTED] Testo da pronunciare: "${text}"`);
 
         // Simula il tempo di caricamento/risposta del TTS (opzionale ma utile per il flusso)
@@ -361,15 +362,21 @@ export class ECAController {
         });
 
         // --- FINE VERSIONE MUTATA ---
+         * 
+         * 
+         * 
+         * 
+         */
 
-        /*
+
+
         // 🚨 CODICE ORIGINALE (COMMENTATO PER RISPARMIARE CREDITI ELEVENLABS) 🚨
         if (this.audioContext && this.audioContext.state === 'suspended') this.audioContext.resume();
         this.currentAudio.pause();
-        
+
         try {
             console.log(`[AURA] Richiesta TTS al Proxy: "${text}"`);
-            
+
             //Chiamata diretta al server locale
             const response = await fetch("http://localhost:8000/api/tts", {
                 method: 'POST',
@@ -424,7 +431,7 @@ export class ECAController {
             this.isSpeaking = false;
             this.setState('IDLE');
         }
-        */
+
     }
 
     /**

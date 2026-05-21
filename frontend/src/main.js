@@ -30,6 +30,10 @@ let currentFinalTranscript = "";
 // Text snippet currently under the user's gaze on the PDF (deictic context)
 let currentGazedText = "";
 
+// Memoria a breve termine per gli interventi proattivi
+let lockedEcaContext = "";
+let lockedEcaContextTime = 0;
+
 // Timestamp (ms) of the last successful gaze-to-text extraction
 let lastGazedTextTimestamp = 0;
 
@@ -215,7 +219,7 @@ function updateMicStatusUI() {
  * to the LLM.
  *
  * @returns {string} Fresh gaze snippet, or "" if no PDF is loaded or the
- *                   snippet is older than GAZE_CONTEXT_TTL_MS.
+ * snippet is older than GAZE_CONTEXT_TTL_MS.
  */
 function _getFreshGazeContext() {
     if (!isPdfLoaded) return "";
@@ -301,7 +305,7 @@ function getVisibleSlideText() {
  * interventions: such slides require a generic, content-agnostic question.
  *
  * @returns {boolean} True if the visible slide has no text layer or its
- *                    text layer is empty.
+ * text layer is empty.
  */
 function isVisibleSlideImageOnly() {
     const wrappers = Array.from(document.querySelectorAll('.pdf-slide-wrapper'));
@@ -484,7 +488,7 @@ async function init() {
  * gaze-derived slide context for prompt injection.
  *
  * @param {string} userText - Either a user utterance or a system-generated
- *                            prompt for a proactive intervention.
+ * prompt for a proactive intervention.
  * @returns {Promise<string>} The LLM's reply text, or a fallback error string.
  */
 async function fetchLLMResponse(userText) {
@@ -492,10 +496,17 @@ async function fetchLLMResponse(userText) {
     // The current message is appended by addChatMessage AFTER this call,
     // so it is intentionally excluded here.
     const recentHistory = chatHistory.slice(-10);
+    // Se l'utente risponde entro 15 secondi da un intervento dell'ECA,
+    // usiamo il testo che l'ECA aveva "puntato", ignorando i micromovimenti recenti degli occhi.
+    let contextToSend = _getFreshGazeContext();
+    if (performance.now() - lockedEcaContextTime < 15000 && lockedEcaContext !== "") {
+        contextToSend = lockedEcaContext;
+    }
+
     const payload = {
         user_text: userText,
         emotion_state: currentEmotionState,
-        slide_context: _getFreshGazeContext(),
+        slide_context: contextToSend, // Usa il contesto intelligente
         chat_history: recentHistory
     };
     try {
@@ -522,9 +533,18 @@ async function fetchLLMResponse(userText) {
  *
  * @param {string} questionText - The transcribed user utterance.
  */
+/**
+ * Handle an explicit user question end-to-end: append it to the chat,
+ * play a short acknowledgement to mask the LLM latency, fetch the reply,
+ * speak it through TTS and reset all UI/state flags.
+ */
 async function manageUserQuestion(questionText) {
     if (isAnsweringUser) return;
     isAnsweringUser = true;
+
+    // AZZERA SOLO LO STRESS QUANDO PARLI TU
+    negativeStateStartTime = 0;
+
     addChatMessage('user', questionText);
     // Filler line: gives the user audible feedback while the LLM responds
     await speakECA("Certo, dammi un secondo.");
@@ -548,7 +568,7 @@ async function manageUserQuestion(questionText) {
  * mirrored webcam canvas. Purely cosmetic feedback for the user.
  *
  * @param {Array<{x:number,y:number}>} landmarks - 468/478 normalised
- *        landmarks as returned by MediaPipe FaceLandmarker.
+ * landmarks as returned by MediaPipe FaceLandmarker.
  */
 function drawFaceMeshSegments(landmarks) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -686,22 +706,25 @@ async function loop() {
                 if (affectAnalyzer.isCalibrating) {
                     const done = affectAnalyzer.processCalibrationSample(rawMetrics);
                     if (done) {
-                        // Baseline complete: hide overlay and play the
-                        // first-time welcome message in a proactive frame
-                        calOverlay.style.display = 'none';
-                        document.getElementById('val-status').innerText = "Calibrazione completata.";
+                        // Keep the overlay visible while we wait for the TTS network call,
+                        // so the user doesn't see a confusing silent gap. The overlay is
+                        // removed only when the ECA is actually about to speak.
+                        document.getElementById('val-status').innerText = "Calibrazione completata. Preparo Aura...";
+                        isProactiveInterventionActive = true;
                         updateMicStatusUI();
-                        setTimeout(async () => {
-                            isProactiveInterventionActive = true;
+                        eca.setState('THINKING');
+                        (async () => {
                             try {
                                 const msg = "Calibrazione completata. Ciao, io sono Aura. Sono un sistema di assistenza proattivo. Rilevo la tua attenzione e se vedo che sei in difficoltà interverrò per darti una mano. Per qualsiasi domanda, chiedi pure.";
                                 addChatMessage('ai', msg);
+                                // Hide the overlay right before the audio actually starts playing
+                                calOverlay.style.display = 'none';
                                 await speakECA(msg);
                             } finally {
                                 isProactiveInterventionActive = false;
                                 updateMicStatusUI();
                             }
-                        }, 1000);
+                        })();
                     }
 
                     // ── Calibrated regime: continuous affect update ──────────────
@@ -715,11 +738,7 @@ async function loop() {
                     document.getElementById('val-au4').innerText = `${state.zCorrugator.toFixed(2)} σ`;
                     document.getElementById('val-ear').innerText = `${state.zEar.toFixed(2)} σ`;
 
-                    // Tell the analyser when the gaze context has gone stale,
-                    // so it can count this towards the gaze-away signal
-                    if (isPdfLoaded && _getFreshGazeContext().length === 0 && lastGazedTextTimestamp > 0) {
-                        affectAnalyzer.notifyGazeAway();
-                    }
+
 
                     // Avoid flipping the status card during the ECA's own actions
                     if (!isProactiveInterventionActive && !isAnsweringUser) updateStatusCard(state);
@@ -786,12 +805,27 @@ async function loop() {
                         if (gazeCtx.length > 5) {
                             // CASE A — gaze is on text: use the precise snippet
                             console.log(`[AURA] Caso A — snippet gaze: "${gazeCtx.substring(0, 60)}..."`);
-                            prompt = `L'utente mostra ${exprList} mentre studia. Sta leggendo questo testo tratto dalla slide:\n"${gazeCtx}"\nFormula una brevissima domanda o proposta empatica (massimo 15 parole) basata su quel contenuto specifico.`;
+                            prompt = `L'utente mostra ${exprList} mentre studia. Sta leggendo questo passaggio dalla slide:
+                            "${gazeCtx}"
+
+                            REGOLE STRETTE:
+                            1. Scrivi UNA SOLA frase che termina con un PUNTO INTERROGATIVO.
+                            2. Massimo 15 parole TOTALI.
+                            3. Formato OBBLIGATORIO: "Vuoi che ti spieghi <concetto>?" oppure "Posso aiutarti con <concetto>?" oppure "Vuoi che riprenda <concetto>?".
+                            4. Sostituisci <concetto> con il concetto specifico del passaggio.
+                            5. NON aggiungere altre frasi dopo il punto interrogativo. NON spiegare nulla.
+                            6. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato".`;
 
                         } else if (isVisibleSlideImageOnly()) {
                             // CASE C — image-only slide: generic empathic ping
                             console.log(`[AURA] Caso C — slide solo immagine, messaggio standard`);
-                            prompt = `L'utente mostra ${exprList} guardando una slide che contiene solo immagini, senza testo. Chiedigli brevemente (massimo 10 parole) se ha bisogno di aiuto, in modo empatico.`;
+                            prompt = `L'utente mostra ${exprList} guardando una slide che contiene solo immagini.
+
+                            REGOLE STRETTE per la risposta:
+                            1. Scrivi UNA SOLA frase empatica di massimo 12 parole.
+                            2. Devi OFFRIRE aiuto, NON fare una domanda di verifica.
+                            3. Esempi validi: "Vedo che stai riflettendo, vuoi che riprendiamo l'argomento?", "Vuoi che ti riepiloghi il concetto precedente?".
+                            4. NON chiedere MAI "cosa non capisci" o "che significa". Sono VIETATE.`;
 
                         } else {
                             // CASE B — gaze off the text but the slide has text:
@@ -799,50 +833,82 @@ async function loop() {
                             const slideText = getVisibleSlideText();
                             if (slideText.length > 5) {
                                 console.log(`[AURA] Caso B — testo intera slide: "${slideText.substring(0, 60)}..."`);
-                                prompt = `L'utente mostra ${exprList}. Non riesco a rilevare esattamente dove stia guardando, ma la slide che sta visualizzando contiene questo testo:\n"${slideText}"\nFormula una domanda diretta e breve (massimo 15 parole) per capire se ha difficoltà con quel contenuto.`;
+                                prompt = `L'utente mostra ${exprList}. Sta guardando una slide che contiene questo testo:
+                                "${slideText}"
+
+                                REGOLE STRETTE:
+                                1. Scrivi UNA SOLA frase che termina con un PUNTO INTERROGATIVO.
+                                2. Massimo 15 parole TOTALI.
+                                3. Formato OBBLIGATORIO: "Vuoi che ti spieghi <concetto>?" oppure "Posso aiutarti con <concetto>?" oppure "Vuoi che riprenda <concetto>?".
+                                4. Sostituisci <concetto> con il concetto principale della slide.
+                                5. NON aggiungere altre frasi dopo il punto interrogativo. NON spiegare nulla.
+                                6. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato".`;
                             } else {
                                 // Final fallback: no usable textual context
                                 console.log(`[AURA] Fallback — nessun testo rilevabile`);
-                                prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando. Fagli una domanda diretta e breve per capire se ha bisogno di aiuto.`;
+                                prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando.
+
+                                REGOLE STRETTE per la risposta:
+                                1. Scrivi UNA SOLA frase empatica di massimo 12 parole.
+                                2. Devi OFFRIRE aiuto, NON fare una domanda di verifica.
+                                3. Esempi validi: "Vedo che fai fatica, vuoi che riprendiamo l'ultimo concetto?", "Vuoi che ti aiuti a riprendere il filo?".
+                                4. NON fare MAI domande del tipo "cosa non capisci" o "che significa".`;
                             }
                         }
+                        // ── Esecuzione della chiamata LLM per l'intervento ──
+                        // ── Esecuzione della chiamata LLM per l'intervento ──
+                        (async () => {
+                            try {
+                                // BLOCCO LA MEMORIA: Salvo il testo che l'ECA sta per usare
+                                lockedEcaContext = gazeCtx.length > 5 ? gazeCtx : getVisibleSlideText();
+                                lockedEcaContextTime = performance.now();
 
-                        // Fire-and-forget: the loop continues while the LLM responds
-                        fetchLLMResponse(prompt).then(phrase => {
-                            addChatMessage('ai', phrase);
-                            speakECA(phrase).then(() => {
+                                // 1. Manda il prompt nascosto all'LLM
+                                const reply = await fetchLLMResponse(prompt);
+
+                                // 2. Aggiungi la risposta alla chat visibile
+                                addChatMessage('ai', reply);
+
+                                // 3. Fai parlare l'avatar
+                                await speakECA(reply);
+                            } catch (err) {
+                                console.error("[AURA] Errore durante l'intervento proattivo:", err);
+                            } finally {
+                                // 4. Rimetti l'avatar a riposo e resetta le variabili
                                 isProactiveInterventionActive = false;
-                                negativeStateStartTime = 0;
+                                eca.setState('IDLE');
                                 updateMicStatusUI();
-                            });
-                        });
-                    }
+                                lastProactiveIntervention = performance.now(); // Fa ripartire il cooldown
 
-                    // ── CSV telemetry row (only while the gaze model is trained) ──
-                    if (gazeCalibrator.regressionModel) {
-                        sessionData.push({
-                            timestamp: ts.toFixed(2),
-                            dtSec: dtSec.toFixed(4),
-                            rawGazeX: currentNormalizedIris?.x.toFixed(5) ?? "0",
-                            rawGazeY: currentNormalizedIris?.y.toFixed(5) ?? "0",
-                            smoothGazeX: currentSmoothPos.x.toFixed(2),
-                            smoothGazeY: currentSmoothPos.y.toFixed(2),
-                            iod: rawMetrics.iod.toFixed(4),
-                            zCorrugator: state.zCorrugator.toFixed(2),
-                            zEar: state.zEar.toFixed(2),
-                            zLipPress: state.zLipPress.toFixed(2),
-                            zMouthOpen: state.zMouthOpen.toFixed(2),
-                            zMouthCurvature: state.zMouthCurvature.toFixed(2),
-                            zNoseWrinkle: state.zNoseWrinkle.toFixed(2),
-                            zBrowRaise: state.zBrowRaise.toFixed(2),
-                            blinkRate: state.blinkRate.toFixed(3),
-                            isInDifficulty: state.isInDifficulty ? 1 : 0,
-                            activeExpressions: state.activeExpressions.join(';'),
-                            gazeAwayCount: state.gazeAwayCount,
-                            gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
-                            emotionState: currentEmotionState,
-                            spokenText: currentFinalTranscript
-                        });
+
+                            }
+                        })();
+                        // ── CSV telemetry row (only while the gaze model is trained) ──
+                        if (gazeCalibrator.regressionModel) {
+                            sessionData.push({
+                                timestamp: ts.toFixed(2),
+                                dtSec: dtSec.toFixed(4),
+                                rawGazeX: currentNormalizedIris?.x.toFixed(5) ?? "0",
+                                rawGazeY: currentNormalizedIris?.y.toFixed(5) ?? "0",
+                                smoothGazeX: currentSmoothPos.x.toFixed(2),
+                                smoothGazeY: currentSmoothPos.y.toFixed(2),
+                                iod: rawMetrics.iod.toFixed(4),
+                                zCorrugator: state.zCorrugator.toFixed(2),
+                                zEar: state.zEar.toFixed(2),
+                                zLipPress: state.zLipPress.toFixed(2),
+                                zMouthOpen: state.zMouthOpen.toFixed(2),
+                                zMouthCurvature: state.zMouthCurvature.toFixed(2),
+                                zNoseWrinkle: state.zNoseWrinkle.toFixed(2),
+                                zBrowRaise: state.zBrowRaise.toFixed(2),
+                                blinkRate: state.blinkRate.toFixed(3),
+                                isInDifficulty: state.isInDifficulty ? 1 : 0,
+                                activeExpressions: state.activeExpressions.join(';'),
+                                gazeAwayCount: state.gazeAwayCount,
+                                gazeContextFresh: (_getFreshGazeContext().length > 0) ? 1 : 0,
+                                emotionState: currentEmotionState,
+                                spokenText: currentFinalTranscript
+                            });
+                        }
                     }
                 }
             }
@@ -952,8 +1018,8 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById('pdf-wrapper').style.display = 'block';
         document.getElementById('btn-show-pdf').style.display = 'none';
         document.getElementById('btn-show-cam').style.display = 'inline-block';
-        // Hide raw metric cards (still updated under the hood) and show the chat panel
-        document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'none');
+        // Metric cards stay visible in PDF mode (live affective telemetry for testing).
+        // The chat panel is also shown, placed below the metric cards in index.html.
         const cc = document.getElementById('chat-container');
         if (cc) cc.style.display = 'flex';
         updateMicStatusUI();
@@ -965,7 +1031,7 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById('video-wrapper').style.display = 'block';
         document.getElementById('btn-show-cam').style.display = 'none';
         document.getElementById('btn-show-pdf').style.display = 'inline-block';
-        document.querySelectorAll('.metric-card').forEach(el => el.style.display = 'block');
+        // Metric cards are already visible — only hide the chat panel
         const cc = document.getElementById('chat-container');
         if (cc) cc.style.display = 'none';
     });
