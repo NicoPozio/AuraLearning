@@ -30,6 +30,9 @@ let currentFinalTranscript = "";
 // Text snippet currently under the user's gaze on the PDF (deictic context)
 let currentGazedText = "";
 
+// Memoria degli ultimi 5 snippet di testo letti dall'utente (Reading Trail)
+let recentGazeHistory = [];
+
 // Memoria a breve termine per gli interventi proattivi
 let lockedEcaContext = "";
 let lockedEcaContextTime = 0;
@@ -492,21 +495,30 @@ async function init() {
  * @returns {Promise<string>} The LLM's reply text, or a fallback error string.
  */
 async function fetchLLMResponse(userText) {
-    // Send only the last 10 turns to keep the context window small.
-    // The current message is appended by addChatMessage AFTER this call,
-    // so it is intentionally excluded here.
     const recentHistory = chatHistory.slice(-10);
+
+    // Unisci gli ultimi 5 elementi letti separandoli con uno spazio (o un separatore)
+    let contextToSend = recentGazeHistory.join(" [...] ");
+
     // Se l'utente risponde entro 15 secondi da un intervento dell'ECA,
-    // usiamo il testo che l'ECA aveva "puntato", ignorando i micromovimenti recenti degli occhi.
-    let contextToSend = _getFreshGazeContext();
+    // usiamo il contesto bloccato in precedenza
     if (performance.now() - lockedEcaContextTime < 15000 && lockedEcaContext !== "") {
         contextToSend = lockedEcaContext;
+    } else if (contextToSend.trim() === "") {
+        // Fallback di sicurezza: se per qualche motivo la cronologia è vuota, manda tutta la slide
+        contextToSend = getVisibleSlideText();
     }
+
+    // --- LOG DEL CONTESTO INVIATO ALL'LLM ---
+    console.log("=========================================");
+    console.log("[LLM CONTEXT] Testo inviato in slide_context:");
+    console.log(contextToSend);
+    console.log("=========================================");
 
     const payload = {
         user_text: userText,
         emotion_state: currentEmotionState,
-        slide_context: contextToSend, // Usa il contesto intelligente
+        slide_context: contextToSend,
         chat_history: recentHistory
     };
     try {
@@ -798,7 +810,9 @@ async function loop() {
                         // ── Three-branch prompt selection ────────────────────
                         // The intervention prompt is tailored to what we know
                         // about the slide the student is looking at.
-                        const gazeCtx = _getFreshGazeContext();
+
+                        // Proviamo a usare la cronologia di lettura
+                        let gazeCtx = recentGazeHistory.join(" [...] ");
                         const exprList = state.activeExpressions.join(', ') || 'espressione di difficoltà';
                         let prompt;
 
@@ -1221,9 +1235,21 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Only update the context when the new snippet differs enough,
         // to keep the LLM prompt stable while the user re-reads the same line
+        // Only update the context when the new snippet differs enough
         if (_snippetChangedSignificantly(snippet, _lastExtractedSnippet)) {
             currentGazedText = snippet;
             _lastExtractedSnippet = snippet;
+
+            // --- NUOVA LOGICA: Aggiorna la cronologia degli ultimi 5 snippet ---
+            // Evitiamo di inserire lo stesso snippet due volte di fila
+            if (recentGazeHistory.length === 0 || recentGazeHistory[recentGazeHistory.length - 1] !== snippet) {
+                recentGazeHistory.push(snippet);
+                if (recentGazeHistory.length > 5) {
+                    recentGazeHistory.shift(); // Rimuove il più vecchio per tenerne solo 5
+                }
+            }
+            // -------------------------------------------------------------------
+
             console.log(`[GAZE] Testo rilevato: "${snippet.substring(0, 80)}..."`);
         }
         // Always refresh the freshness timestamp, even when the snippet is unchanged

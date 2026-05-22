@@ -189,12 +189,12 @@ export class AffectAnalyzer {
             // Per-metric minimum sigma values chosen empirically so that a
             // single-frame muscle twitch maps to roughly a 1σ z-score
             this.baseline.corrugator = stat('corrugator', 0.020);
-            this.baseline.ear = stat('ear', 0.060);                   // Alzato tantissimo (ignora i battiti di ciglia lenti)
+            this.baseline.ear = stat('ear', 0.050);                   // Alzato tantissimo (ignora i battiti di ciglia lenti)
             this.baseline.lipPress = stat('lipPress', 0.025);
             this.baseline.mouthOpen = stat('mouthOpen', 0.030);
-            this.baseline.mouthCurvature = stat('mouthCurvature', 0.050); // Alzato tantissimo (ignora i cambi di postura del collo)
+            this.baseline.mouthCurvature = stat('mouthCurvature', 0.060); // Alzato tantissimo (ignora i cambi di postura del collo)
             this.baseline.noseWrinkle = stat('noseWrinkle', 0.035);   // Alzato 
-            this.baseline.innerBrowRaise = stat('innerBrowRaise', 0.050); // Alzato tantissimo (ignora se abbassi il mento)
+            this.baseline.innerBrowRaise = stat('innerBrowRaise', 0.060); // Alzato tantissimo (ignora se abbassi il mento)
             this.baseline.smileIntensity = stat('smileIntensity', 0.040);
             this.isCalibrating = false;
             this.isCalibrated = true;
