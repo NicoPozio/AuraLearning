@@ -117,6 +117,17 @@ const WAKE_WORD_RE = /\baura\b/i;
 // Used as an anti-echo measure right after the ECA finishes speaking.
 let ignoreMicUntil = 0;
 
+// ── Speaking gate ──────────────────────────────────────────────────────────
+// Timestamp until which we treat the user as "currently speaking". Used by the
+// AffectAnalyzer to suppress mouth-related AUs (lipPress, mouthOpen) that
+// would otherwise fire as false positives every time the user talks.
+let userSpeakingUntil = 0;
+
+// Tail window after the last interim transcript: keeps the gate open for a
+// bit so the closing of the mouth at the end of an utterance doesn't slip
+// through as a spurious mouthOpen detection.
+const USER_SPEAKING_TAIL_MS = 1200;
+
 // Debounce timer that returns the ECA from LISTENING back to IDLE after silence
 let userMicTimeout = null;
 
@@ -382,6 +393,16 @@ async function init() {
     voiceInput = new VoiceInput(
         // onTranscript: invoked on every interim/final transcript chunk
         (interim, final) => {
+            // ── Speaking gate update (runs BEFORE any other gate) ───────
+            // Any interim or final transcript from the STT means the user is
+            // moving their mouth right now. We keep the gate open for
+            // USER_SPEAKING_TAIL_MS after the last transcript so the mouth
+            // closure at the end of speech doesn't trigger a false positive
+            // on mouthOpen / lipPress.
+            if (interim || final) {
+                userSpeakingUntil = performance.now() + USER_SPEAKING_TAIL_MS;
+            }
+
             // ── Mic gates, evaluated in priority order ──────────────────
 
             // 1. Anti-echo gate (highest priority) — drop everything while
@@ -741,7 +762,12 @@ async function loop() {
 
                     // ── Calibrated regime: continuous affect update ──────────────
                 } else if (affectAnalyzer.isCalibrated) {
-                    const state = affectAnalyzer.update(rawMetrics, dtSec);
+                    // Speaking gate: true while the STT is actively transcribing
+                    // (or within the tail window after the last transcript).
+                    // The analyser uses this flag to suppress lipPress / mouthOpen,
+                    // which would otherwise trigger on every spoken word.
+                    const isUserSpeaking = performance.now() < userSpeakingUntil;
+                    const state = affectAnalyzer.update(rawMetrics, dtSec, isUserSpeaking);
 
                     // Coarse label used by the LLM prompt
                     currentEmotionState = state.isInDifficulty ? "In difficoltà" : "Normale";
@@ -822,24 +848,27 @@ async function loop() {
                             prompt = `L'utente mostra ${exprList} mentre studia. Sta leggendo questo passaggio dalla slide:
                             "${gazeCtx}"
 
-                            REGOLE STRETTE:
-                            1. Scrivi UNA SOLA frase che termina con un PUNTO INTERROGATIVO.
-                            2. Massimo 15 parole TOTALI.
-                            3. Formato OBBLIGATORIO: "Vuoi che ti spieghi <concetto>?" oppure "Posso aiutarti con <concetto>?" oppure "Vuoi che riprenda <concetto>?".
-                            4. Sostituisci <concetto> con il concetto specifico del passaggio.
-                            5. NON aggiungere altre frasi dopo il punto interrogativo. NON spiegare nulla.
-                            6. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato".`;
+                            REGOLE STRETTE per la tua risposta:
+                            1. Scrivi UNA SOLA frase, fluida e naturale, che termina con un PUNTO INTERROGATIVO.
+                            2. Lunghezza: massimo 22 parole TOTALI, minimo 10. Non frasi telegrafiche.
+                            3. Identifica il concetto chiave del passaggio (es: "definizione di spazio vettoriale", "proprietà commutativa", "standard basis", "indipendenza lineare") e nominalo esplicitamente.
+                            4. La frase deve essere un'OFFERTA di aiuto contestualizzata, non una domanda di verifica. Usa apertura tipo: "Vuoi che ti spieghi...", "Posso accompagnarti attraverso...", "Ti aiuto a chiarire...", "Vuoi che riprenda passo passo...", "Ti mostro come si arriva a...", "Posso darti un esempio concreto di...".
+                            5. Dopo aver nominato il concetto, aggiungi UN dettaglio che mostri che hai capito il passaggio (es: "...visto che si tratta di una proprietà fondamentale", "...partendo dall'idea di vettore", "...con un esempio numerico").
+                            6. NON aggiungere altre frasi dopo il punto interrogativo. NON dare la spiegazione: limitati a offrirla.
+                            7. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato", frasi che chiedono all'utente di spiegare.`;
 
                         } else if (isVisibleSlideImageOnly()) {
                             // CASE C — image-only slide: generic empathic ping
                             console.log(`[AURA] Caso C — slide solo immagine, messaggio standard`);
-                            prompt = `L'utente mostra ${exprList} guardando una slide che contiene solo immagini.
+                            prompt = `L'utente mostra ${exprList} guardando una slide che contiene solo immagini, senza testo selezionabile.
 
-                            REGOLE STRETTE per la risposta:
-                            1. Scrivi UNA SOLA frase empatica di massimo 12 parole.
-                            2. Devi OFFRIRE aiuto, NON fare una domanda di verifica.
-                            3. Esempi validi: "Vedo che stai riflettendo, vuoi che riprendiamo l'argomento?", "Vuoi che ti riepiloghi il concetto precedente?".
-                            4. NON chiedere MAI "cosa non capisci" o "che significa". Sono VIETATE.`;
+                            REGOLE STRETTE per la tua risposta:
+                            1. Scrivi UNA SOLA frase empatica, fluida e naturale, che termina con un PUNTO INTERROGATIVO.
+                            2. Lunghezza: massimo 18 parole TOTALI, minimo 8.
+                            3. Dato che non hai il testo della slide, formula un'OFFERTA di aiuto generica ma calorosa, riferendoti alla slide visiva.
+                            4. Esempi di buone aperture: "Vedo che stai osservando questa slide, vuoi che ti accompagni a leggerla insieme?", "Sembra che questa figura richieda attenzione, posso aiutarti a interpretarla?", "Vuoi che riprendiamo insieme il concetto della slide precedente?".
+                            5. NON aggiungere altre frasi dopo il punto interrogativo.
+                            6. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato".`;
 
                         } else {
                             // CASE B — gaze off the text but the slide has text:
@@ -850,23 +879,26 @@ async function loop() {
                                 prompt = `L'utente mostra ${exprList}. Sta guardando una slide che contiene questo testo:
                                 "${slideText}"
 
-                                REGOLE STRETTE:
-                                1. Scrivi UNA SOLA frase che termina con un PUNTO INTERROGATIVO.
-                                2. Massimo 15 parole TOTALI.
-                                3. Formato OBBLIGATORIO: "Vuoi che ti spieghi <concetto>?" oppure "Posso aiutarti con <concetto>?" oppure "Vuoi che riprenda <concetto>?".
-                                4. Sostituisci <concetto> con il concetto principale della slide.
-                                5. NON aggiungere altre frasi dopo il punto interrogativo. NON spiegare nulla.
-                                6. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato".`;
+                                REGOLE STRETTE per la tua risposta:
+                                1. Scrivi UNA SOLA frase, fluida e naturale, che termina con un PUNTO INTERROGATIVO.
+                                2. Lunghezza: massimo 22 parole TOTALI, minimo 10. Non frasi telegrafiche.
+                                3. Identifica il concetto principale della slide (il titolo o l'idea centrale che lega il testo) e nominalo esplicitamente.
+                                4. La frase deve essere un'OFFERTA di aiuto, non una domanda di verifica. Usa apertura tipo: "Vuoi che ti spieghi...", "Posso accompagnarti attraverso...", "Ti aiuto a chiarire...", "Vuoi che riprenda passo passo...", "Ti mostro un esempio concreto di...".
+                                5. Aggiungi UN dettaglio che mostri che hai capito di cosa parla la slide (es: "...partendo dalla definizione formale", "...con un esempio in R²", "...mettendo in luce la differenza con i casi precedenti").
+                                6. NON aggiungere altre frasi dopo il punto interrogativo. NON dare la spiegazione: limitati a offrirla.
+                                7. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato", frasi che chiedono all'utente di spiegare.`;
                             } else {
                                 // Final fallback: no usable textual context
                                 console.log(`[AURA] Fallback — nessun testo rilevabile`);
-                                prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando.
+                                prompt = `L'utente mostra ${exprList}. Non sto rilevando cosa stia guardando esattamente, ma è chiaramente in un momento di difficoltà.
 
-                                REGOLE STRETTE per la risposta:
-                                1. Scrivi UNA SOLA frase empatica di massimo 12 parole.
-                                2. Devi OFFRIRE aiuto, NON fare una domanda di verifica.
-                                3. Esempi validi: "Vedo che fai fatica, vuoi che riprendiamo l'ultimo concetto?", "Vuoi che ti aiuti a riprendere il filo?".
-                                4. NON fare MAI domande del tipo "cosa non capisci" o "che significa".`;
+                                REGOLE STRETTE per la tua risposta:
+                                1. Scrivi UNA SOLA frase empatica, fluida e naturale, che termina con un PUNTO INTERROGATIVO.
+                                2. Lunghezza: massimo 18 parole TOTALI, minimo 8.
+                                3. Dato che non hai contesto specifico, formula un'OFFERTA di aiuto generica ma calorosa, che inviti l'utente a indicarti su cosa concentrarci.
+                                4. Esempi di buone aperture: "Vedo che ti stai bloccando, vuoi che riprendiamo insieme l'ultimo concetto?", "Posso aiutarti a riprendere il filo del discorso?", "Vuoi che ricapitoli i punti chiave fin qui?".
+                                5. NON aggiungere altre frasi dopo il punto interrogativo.
+                                6. VIETATE: "Cosa non capisci", "Che significa", "Qual è il significato".`;
                             }
                         }
                         // ── Esecuzione della chiamata LLM per l'intervento ──
@@ -1032,8 +1064,9 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById('pdf-wrapper').style.display = 'block';
         document.getElementById('btn-show-pdf').style.display = 'none';
         document.getElementById('btn-show-cam').style.display = 'inline-block';
-        // Metric cards stay visible in PDF mode (live affective telemetry for testing).
-        // The chat panel is also shown, placed below the metric cards in index.html.
+        // In PDF mode hide the per-AU detail cards (AU4 / EAR / Coordinate Sguardo).
+        // Keep visible: ECA, Stato Studente, Segnali ME (debug), Input Vocale (STT), Chat.
+        document.querySelectorAll('.pdf-hide').forEach(el => el.style.display = 'none');
         const cc = document.getElementById('chat-container');
         if (cc) cc.style.display = 'flex';
         updateMicStatusUI();
@@ -1045,7 +1078,8 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById('video-wrapper').style.display = 'block';
         document.getElementById('btn-show-cam').style.display = 'none';
         document.getElementById('btn-show-pdf').style.display = 'inline-block';
-        // Metric cards are already visible — only hide the chat panel
+        // Restore the per-AU detail cards and hide the chat panel
+        document.querySelectorAll('.pdf-hide').forEach(el => el.style.display = '');
         const cc = document.getElementById('chat-container');
         if (cc) cc.style.display = 'none';
     });

@@ -64,11 +64,11 @@ export class AffectAnalyzer {
         this._MEs = {
             browFurrow: { zThresh: 1.0, durationMs: 1800, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
             eyeSquint: { zThresh: 1.1, durationMs: 1400, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
-            lipPress: { zThresh: 1.2, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
+            lipPress: { zThresh: 0.8, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthOpen: { zThresh: 1.5, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthFrown: { zThresh: 1.0, durationMs: 1500, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
-            noseWrinkle: { zThresh: 1.0, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
-            browRaise: { zThresh: 1.5, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
+            noseWrinkle: { zThresh: 1.5, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
+            browRaise: { zThresh: 1.0, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
             faceAbsent: { zThresh: 0, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
         };
 
@@ -261,12 +261,19 @@ export class AffectAnalyzer {
      * the personal baseline, runs each ME's hysteresis timer, updates
      * the overall "in difficulty" flag and the adaptive baseline.
      *
-     * @param {Object} metrics - Output of FaceMetricsExtractor.extractRawMetrics.
-     * @param {number} dtSec   - Seconds elapsed since the previous update.
+     * @param {Object}  metrics        - Output of FaceMetricsExtractor.extractRawMetrics.
+     * @param {number}  dtSec          - Seconds elapsed since the previous update.
+     * @param {boolean} [isUserSpeaking=false] - True while the user is actively
+     *        speaking to the system. When true, the mouth-related signals
+     *        (lipPress, mouthOpen) are forced to false, because the user
+     *        moving the mouth to articulate words would otherwise produce
+     *        false-positive activations. The latched ME states are NOT
+     *        cleared, only the instantaneous detection is suppressed, so
+     *        the deactivation timer can drain normally during speech.
      * @returns {Object|null} Affective state for this frame, or null if
      *                        the analyser is not calibrated yet.
      */
-    update(metrics, dtSec) {
+    update(metrics, dtSec, isUserSpeaking = false) {
         if (!this.isCalibrated) return null;
 
         const nowMs = performance.now();
@@ -320,11 +327,16 @@ export class AffectAnalyzer {
         const zMouthCurvature = z('mouthCurvature');  // positive = corners pulled down = frown
 
         // ── Map z-scores to instantaneous boolean signals ───────────────
+        // While the user is speaking, lipPress and mouthOpen are forced to
+        // false: articulating words mechanically opens and closes the mouth,
+        // which would otherwise look identical to a frustration / surprise
+        // signal. The other AUs (brow, eyes, nose) are NOT suppressed because
+        // they are not affected by the act of speaking.
         const signals = {
             browFurrow: zCorrugator > this._MEs.browFurrow.zThresh,
             eyeSquint: zEar > this._MEs.eyeSquint.zThresh,
-            lipPress: zLipPress > this._MEs.lipPress.zThresh,
-            mouthOpen: zMouthOpen > this._MEs.mouthOpen.zThresh,
+            lipPress: isUserSpeaking ? false : (zLipPress > this._MEs.lipPress.zThresh),
+            mouthOpen: isUserSpeaking ? false : (zMouthOpen > this._MEs.mouthOpen.zThresh),
             noseWrinkle: zNoseWrinkle > this._MEs.noseWrinkle.zThresh,
             browRaise: zBrowRaise > this._MEs.browRaise.zThresh,
             mouthFrown: zMouthCurvature > this._MEs.mouthFrown.zThresh,
@@ -433,15 +445,18 @@ export class AffectAnalyzer {
             blinkRate: this.blinkRate,
             gazeAwayCount: this._gazeAwayTimestamps.length,
             zMouthCurvature,
-            // Instantaneous threshold-crossing booleans (debug sidebar)
+            // Instantaneous threshold-crossing booleans (debug sidebar).
+            // Reuses the same `signals` object computed above, so the
+            // speaking-gate suppression of lipPress / mouthOpen is reflected
+            // in the dots on the UI too.
             debugSignals: {
-                browFurrow: zCorrugator > this._MEs.browFurrow.zThresh,
-                eyeSquint: zEar > this._MEs.eyeSquint.zThresh,
-                lipPress: zLipPress > this._MEs.lipPress.zThresh,
-                mouthOpen: zMouthOpen > this._MEs.mouthOpen.zThresh,
-                mouthFrown: zMouthCurvature > this._MEs.mouthFrown.zThresh,
-                noseWrinkle: zNoseWrinkle > this._MEs.noseWrinkle.zThresh,
-                browRaise: zBrowRaise > this._MEs.browRaise.zThresh,
+                browFurrow: signals.browFurrow,
+                eyeSquint: signals.eyeSquint,
+                lipPress: signals.lipPress,
+                mouthOpen: signals.mouthOpen,
+                mouthFrown: signals.mouthFrown,
+                noseWrinkle: signals.noseWrinkle,
+                browRaise: signals.browRaise,
             },
             // Full set of raw z-scores (calibration / diagnostics)
             rawZ: { zCorrugator, zEar, zLipPress, zMouthOpen, zMouthCurvature, zNoseWrinkle, zBrowRaise },

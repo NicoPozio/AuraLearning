@@ -62,15 +62,16 @@ async def chat_endpoint(request: ChatRequest):
             context_injection = f"Ecco il testo delle slide:\n{request.slide_context}\n"
 
         # Construct the System Prompt guiding the AI tutor's behavior
-        system_prompt = f"""Sei Aura, un tutor didattico virtuale.
-            L'utente sembra: {request.emotion_state}.
+        system_prompt = f"""Sei Aura, un brillante tutor universitario. 
+            L'utente ha un livello di attenzione: {request.emotion_state}.
             {context_injection}
-            REGOLE:
-            1. NON presentarti mai.
-            2. Vai dritto al sodo e basa le tue risposte sul contenuto delle slide.
-            3. Sii concisa (max 3 frasi).
-            4. Solo testo semplice. ASSOLUTAMENTE NESSUNA FORMATTAZIONE. Vietato usare Markdown, vietati gli asterischi, vietati i simboli matematici speciali. Scrivi tutto a parole in italiano."""
-
+            
+            REGOLE STRETTE DI RISPOSTA:
+            1. NON limitarti a tradurre o riassumere il testo. Spiega il CONCETTO in modo naturale e discorsivo, come se stessi parlando a uno studente.
+            2. Usa un italiano eccellente e colloquiale. Mantieni i termini tecnici specifici in inglese (es. "Control-Value Theory", "gaze-away") senza inventare traduzioni macchinose o inesistenti (VIETATO usare parole come "addressato").
+            3. Se l'utente usa parole come "questo" o "questa cosa", sostituiscile tu nella spiegazione con il concetto reale a cui si riferisce il testo.
+            4. Vai dritto al punto senza presentarti. Sii concisa (massimo 5 frasi brevi) per permettere una sintesi vocale fluida.
+            5. ASSOLUTAMENTE NESSUNA FORMATTAZIONE (niente Markdown, elenchi, o simboli speciali). Solo testo leggibile a voce."""
         # Build the messages array: system prompt + chat history + current user message
         # The frontend sends history using Gemini's role format ("user"/"model").
         # We map "model" to "assistant" to make it compatible with Groq/OpenAI APIs.

@@ -330,68 +330,39 @@ export class ECAController {
      * an utterance for a duration proportional to the text length, then
      * return to IDLE.
      *
-     * NOTE — current implementation is muted (no real TTS) to conserve
-     * ElevenLabs API credits. The original implementation that hits the
-     * /api/tts FastAPI proxy is preserved as a commented block below and
-     * must NOT be removed: it is the fallback path used in production.
+     * Invia la richiesta al proxy FastAPI. Se ElevenLabs restituisce 401 (token finiti),
+     * passa automaticamente al sintetizzatore vocale nativo del browser.
      *
      * @param {string} text - The phrase the avatar should "speak".
-     * @returns {Promise<void>} Resolves when the simulated playback ends.
+     * @returns {Promise<void>} Resolves when the playback ends.
      */
     async speak(text) {
-        /**
-         * // --- INIZIO VERSIONE MUTATA (RISPARMIO CREDITI) ---
-        console.log(`🔇 [AURA MUTED] Testo da pronunciare: "${text}"`);
-
-        // Simula il tempo di caricamento/risposta del TTS (opzionale ma utile per il flusso)
-        await new Promise(resolve => setTimeout(resolve, 500));
-
-        this.isSpeaking = true;
-        this.setState('SPEAKING');
-
-        return new Promise((resolve) => {
-            // Calcoliamo una durata simulata basata sulla lunghezza del testo
-            // Stimiamo circa 100 millisecondi a carattere, con un minimo di 2 secondi
-            const durationMs = Math.max(2000, text.length * 100);
-
-            setTimeout(() => {
-                this.isSpeaking = false;
-                this.setState('IDLE');
-                resolve();
-            }, durationMs);
-        });
-
-        // --- FINE VERSIONE MUTATA ---
-         * 
-         * 
-         * 
-         * 
-         */
-
-
-
-        // 🚨 CODICE ORIGINALE (COMMENTATO PER RISPARMIARE CREDITI ELEVENLABS) 🚨
-        if (this.audioContext && this.audioContext.state === 'suspended') this.audioContext.resume();
+        // Interrompe audio in corso (sia ElevenLabs che Browser)
         this.currentAudio.pause();
+        window.speechSynthesis.cancel();
 
         try {
             console.log(`[AURA] Richiesta TTS al Proxy: "${text}"`);
 
-            //Chiamata diretta al server locale
             const response = await fetch("http://localhost:8000/api/tts", {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text: text })
             });
 
+            // Controllo per Errore 401 (Unauthorized - Crediti esauriti)
             if (!response.ok) {
+                if (response.status === 401) {
+                    console.warn("⚠️ [AURA] Crediti ElevenLabs esauriti (HTTP 401). Attivazione Fallback browser...");
+                    return this._speakWithBrowserFallback(text); // Esce e usa il fallback
+                }
                 throw new Error(`Errore Proxy: HTTP ${response.status}`);
             }
 
             const blob = await response.blob();
             const audioUrl = URL.createObjectURL(blob);
 
-            //Pulizia eventi precedenti
+            // Pulizia eventi precedenti
             this.currentAudio.onplay = null;
             this.currentAudio.onended = null;
             this.currentAudio.onerror = null;
@@ -412,7 +383,7 @@ export class ECAController {
                 };
 
                 this.currentAudio.onerror = (e) => {
-                    console.error("❌ [AURA] Errore riproduzione audio.");
+                    console.error("❌ [AURA] Errore riproduzione audio ElevenLabs.");
                     this.isSpeaking = false;
                     this.setState('IDLE');
                     resolve();
@@ -427,11 +398,47 @@ export class ECAController {
             });
 
         } catch (error) {
+            // Se il server Python è spento o la rete cade, usa comunque il fallback
             console.error("❌ [AURA] Fallimento API ElevenLabs:", error);
-            this.isSpeaking = false;
-            this.setState('IDLE');
+            console.warn("⚠️ [AURA] Rete o server non disponibili. Attivazione Fallback vocale del browser...");
+            return this._speakWithBrowserFallback(text);
         }
+    }
 
+    /**
+     * HELPER: Sintesi vocale nativa del browser (Fallback)
+     * Mantiene sincronizzata l'animazione FBX del modello 3D.
+     */
+    _speakWithBrowserFallback(text) {
+        return new Promise((resolve) => {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'it-IT'; // Forza la pronuncia italiana
+
+            // Cerca una voce italiana di default
+            const voices = window.speechSynthesis.getVoices();
+            const italianVoice = voices.find(v => v.lang.startsWith('it'));
+            if (italianVoice) utterance.voice = italianVoice;
+
+            utterance.onstart = () => {
+                this.setState('SPEAKING');
+                this.isSpeaking = true;
+            };
+
+            utterance.onend = () => {
+                this.setState('IDLE');
+                this.isSpeaking = false;
+                resolve();
+            };
+
+            utterance.onerror = (e) => {
+                console.error("❌ [AURA] Fallback vocale del browser fallito:", e);
+                this.setState('IDLE');
+                this.isSpeaking = false;
+                resolve();
+            };
+
+            window.speechSynthesis.speak(utterance);
+        });
     }
 
     /**

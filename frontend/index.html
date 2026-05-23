@@ -484,15 +484,16 @@
             </div>
 
             <!-- Individual Z-Score readouts and gaze coordinates (final on-screen pixels) -->
-            <div class="data-card metric-card">
+            <!-- These 3 cards carry the .pdf-hide class so main.js can hide them in PDF mode -->
+            <div class="data-card metric-card pdf-hide">
                 <div class="data-title">Tensione Corrugatore (AU4)</div>
                 <div class="data-value" id="val-au4">0.00 σ</div>
             </div>
-            <div class="data-card metric-card">
+            <div class="data-card metric-card pdf-hide">
                 <div class="data-title">Sforzo Visivo (EAR)</div>
                 <div class="data-value" id="val-ear">0.00 σ</div>
             </div>
-            <div class="data-card metric-card">
+            <div class="data-card metric-card pdf-hide">
                 <div class="data-title">Coordinate Sguardo</div>
                 <div class="data-value" id="val-gaze">X: --, Y: --</div>
             </div>
