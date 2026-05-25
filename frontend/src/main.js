@@ -13,6 +13,8 @@ import { ECAController } from "./eca/ECAController.js";
 // ───────────────────────────────────────────────────────────────────────────
 let video, canvas, ctx, gazeDot;
 let btnCalGaze, btnCalEmotion, calOverlay;
+let fpsBuffer = [];
+
 
 // ───────────────────────────────────────────────────────────────────────────
 // SESSION / RUNTIME STATE
@@ -667,6 +669,11 @@ async function loop() {
             const dtSec = Math.min((ts - lastFrameTimeMs) / 1000.0, 0.1);
             lastFrameTimeMs = ts;
             lastVideoTime = video.currentTime;
+
+            fpsBuffer.push(1 / dtSec);
+            if (fpsBuffer.length > 30) fpsBuffer.shift();
+            const avgFps = Math.round(fpsBuffer.reduce((a, b) => a + b) / fpsBuffer.length);
+            document.getElementById('val-fps').innerText = `${avgFps} fps`;
 
             // Advance the ECA animation clock (mixer.update needs dt)
             eca.update(dtSec);
