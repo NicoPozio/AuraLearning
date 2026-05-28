@@ -670,7 +670,7 @@ async function loop() {
             lastFrameTimeMs = ts;
             lastVideoTime = video.currentTime;
 
-            
+
             // Advance the ECA animation clock (mixer.update needs dt)
             eca.update(dtSec);
             canvas.width = video.videoWidth;
