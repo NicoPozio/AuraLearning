@@ -1,20 +1,28 @@
-Then open `http://localhost:5500` in a Chromium-based browser (required for the Web Speech API).
+# Aura Learning Assistant
 
-## Usage
+A Multimodal Affective Tutoring System — project for the course **Multimodal Interaction**, Sapienza University of Rome.
 
-1. **Gaze calibration** — click *Calibrazione Sguardo* and fixate each of the nine points, holding the space bar while looking at each one.
-2. **Emotion calibration** — click *Calibrazione Emotiva* and hold a neutral expression for about four seconds.
-3. **Load a PDF** — drop a slide deck into the study area. Aura confirms when the semantic layer is ready.
-4. **Study** — read normally. Aura intervenes on its own when it detects sustained difficulty, or you can ask explicitly by saying the wake word *"Aura"* followed by your question.
+Developed by **Leonardo Costantini** and **Niccolò Pozio**.
 
-## Two activation modes
+Aura is a browser-based proactive tutoring system that detects signs of cognitive difficulty in students studying PDF slide decks, using only a standard webcam. It combines real-time facial microexpression analysis, gaze-based text extraction, and an LLM-driven Embodied Conversational Agent (ECA) to deliver spoken, contextually grounded interventions. The entire perception pipeline runs client-side, so no biometric data ever leaves the device.
 
-- **Explicit** — the user says the wake word *"Aura"* followed by a request. The prompt is didactic and the user controls the timing.
-- **Proactive** — the agent speaks without being addressed, because a difficulty state has persisted past its threshold. The prompt instructs the model to produce a short, empathic, supportive sentence rather than a lecture. A 30-second cooldown prevents repeated interruptions.
+## How it works
 
-## Validation
+The system is organized into five modules communicating through shared state:
 
-Validation was performed informally through systematic expression-testing sessions: after a neutral calibration, each microexpression was held in isolation while observing the live z-score debug sidebar to confirm correct detection. The full pipeline was also verified end-to-end on real slide decks, with the ECA delivering an intervention within roughly 7–8 seconds of expression onset — consistent with the sum of the activation window and the five-second persistence timer. A proper evaluation of *learning benefit* would require a user study with ground-truth difficulty annotations, which is left as future work.
+1. **Sensing** — MediaPipe extracts 478 facial landmarks per webcam frame (~30 FPS).
+2. **Affect Analysis** — eight geometric detectors, each mapped to a FACS Action Unit, normalized against the user's personal baseline via z-score and governed by bidirectional hysteresis to suppress false positives.
+3. **Gaze Pipeline** — an iris-displacement estimator, corrected for head pose and depth, mapped to screen pixels through a nine-point Thin-Plate Spline calibration and smoothed with the One-Euro filter.
+4. **Context Extraction** — every 500 ms the gaze coordinate is matched against the PDF.js text layer to identify the exact span being read.
+5. **Interaction** — when a difficulty state persists for five seconds, the affect state and reading context are sent to the LLM, and the reply is spoken by the ECA avatar.
+
+## Activation modes
+
+- **Explicit** — the user says the wake word *"Aura"* followed by a request; the prompt is didactic.
+- **Proactive** — the agent speaks on its own when difficulty persists past threshold; the prompt is short and empathic. A 30-second cooldown prevents repeated interruptions.
+
+
+
 ## Technology stack
 
 | Component | Technology |
@@ -56,8 +64,7 @@ Then open `http://localhost:5500`.
 4. **Study** — read normally; Aura intervenes on sustained difficulty, or say *"Aura"* to ask explicitly.
 
 
+
 ## License
 
 Educational use, Multimodal Interaction, Sapienza University of Rome.
-
-
