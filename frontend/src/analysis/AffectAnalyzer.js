@@ -190,7 +190,7 @@ export class AffectAnalyzer {
             // single-frame muscle twitch maps to roughly a 1σ z-score
             this.baseline.corrugator = stat('corrugator', 0.020);
             this.baseline.ear = stat('ear', 0.050);                   // Alzato tantissimo (ignora i battiti di ciglia lenti)
-            this.baseline.lipPress = stat('lipPress', 0.025);
+            this.baseline.lipPress = stat('lipPress', 0.045);
             this.baseline.mouthOpen = stat('mouthOpen', 0.030);
             this.baseline.mouthCurvature = stat('mouthCurvature', 0.060); // Alzato tantissimo (ignora i cambi di postura del collo)
             this.baseline.noseWrinkle = stat('noseWrinkle', 0.035);   // Alzato 
@@ -332,10 +332,12 @@ export class AffectAnalyzer {
         // which would otherwise look identical to a frustration / surprise
         // signal. The other AUs (brow, eyes, nose) are NOT suppressed because
         // they are not affected by the act of speaking.
+        const MOUTH_OPEN_GATE_FOR_LIPPRESS = 1.0; // z-score; below mouthOpen.zThresh on purpose
+        const mouthIsOpening = zMouthOpen > MOUTH_OPEN_GATE_FOR_LIPPRESS;
         const signals = {
             browFurrow: zCorrugator > this._MEs.browFurrow.zThresh,
             eyeSquint: zEar > this._MEs.eyeSquint.zThresh,
-            lipPress: isUserSpeaking ? false : (zLipPress > this._MEs.lipPress.zThresh),
+            lipPress: (isUserSpeaking || mouthIsOpening) ? false : (zLipPress > this._MEs.lipPress.zThresh),
             mouthOpen: isUserSpeaking ? false : (zMouthOpen > this._MEs.mouthOpen.zThresh),
             noseWrinkle: zNoseWrinkle > this._MEs.noseWrinkle.zThresh,
             browRaise: zBrowRaise > this._MEs.browRaise.zThresh,
