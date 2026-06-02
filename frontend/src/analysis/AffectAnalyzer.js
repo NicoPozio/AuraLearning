@@ -63,8 +63,8 @@ export class AffectAnalyzer {
         // quick enough to feel responsive once the user calms down.
         this._MEs = {
             browFurrow: { zThresh: 1.0, durationMs: 1800, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
-            eyeSquint: { zThresh: 1.1, durationMs: 1400, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
-            lipPress: { zThresh: 0.8, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
+            eyeSquint: { zThresh: 1.5, durationMs: 1400, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
+            lipPress: { zThresh: 1.2, durationMs: 1500, deactivateMs: 1000, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthOpen: { zThresh: 1.5, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
             mouthFrown: { zThresh: 1.0, durationMs: 1500, deactivateMs: 1200, _sinceMs: 0, _offSinceMs: 0, active: false },
             noseWrinkle: { zThresh: 1.5, durationMs: 1500, deactivateMs: 800, _sinceMs: 0, _offSinceMs: 0, active: false },
@@ -189,11 +189,11 @@ export class AffectAnalyzer {
             // Per-metric minimum sigma values chosen empirically so that a
             // single-frame muscle twitch maps to roughly a 1σ z-score
             this.baseline.corrugator = stat('corrugator', 0.020);
-            this.baseline.ear = stat('ear', 0.050);                   // Alzato tantissimo (ignora i battiti di ciglia lenti)
+            this.baseline.ear = stat('ear', 0.065);                   // Alzato tantissimo (ignora i battiti di ciglia lenti)
             this.baseline.lipPress = stat('lipPress', 0.045);
             this.baseline.mouthOpen = stat('mouthOpen', 0.030);
             this.baseline.mouthCurvature = stat('mouthCurvature', 0.060); // Alzato tantissimo (ignora i cambi di postura del collo)
-            this.baseline.noseWrinkle = stat('noseWrinkle', 0.035);   // Alzato 
+            this.baseline.noseWrinkle = stat('noseWrinkle', 0.040);   // Alzato 
             this.baseline.innerBrowRaise = stat('innerBrowRaise', 0.060); // Alzato tantissimo (ignora se abbassi il mento)
             this.baseline.smileIntensity = stat('smileIntensity', 0.040);
             this.isCalibrating = false;
