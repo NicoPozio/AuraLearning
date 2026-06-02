@@ -42,6 +42,20 @@ let lockedEcaContextTime = 0;
 // Timestamp (ms) of the last successful gaze-to-text extraction
 let lastGazedTextTimestamp = 0;
 
+// Timestamp (ms) of the last time the gaze actually landed on a real text span.
+// Used to detect when the user has been looking at a non-text region (e.g. a
+// large image) for a while, so we can fall back to the whole-slide text.
+let lastRealTextHitTime = 0;
+
+// Page number (from the PDF slide wrapper) the gaze was last reading. When the
+// user moves to a different slide, the reading-trail history is cleared so the
+// LLM context doesn't stay "stuck" on the previous slide's topic.
+let lastGazedPageNum = null;
+
+// If the gaze fails to hit any text span for this long while a text-bearing
+// slide is visible, fall back to using the full visible-slide text as context.
+const GAZE_NO_TEXT_FALLBACK_MS = 2000;
+
 // Freshness window: gaze snippets older than this are considered stale
 const GAZE_CONTEXT_TTL_MS = 3000;
 
@@ -1217,6 +1231,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 isPdfLoaded = true;
                 // Reset the cooldown so we don't immediately fire a proactive call
                 lastProactiveIntervention = performance.now();
+                // Start the no-text fallback timer fresh, so we don't trigger the
+                // whole-slide fallback in the first instants after loading.
+                lastRealTextHitTime = performance.now();
+                // Reset slide-change tracking for the newly loaded PDF
+                lastGazedPageNum = null;
                 // Poll the gaze position twice per second to update the deictic context
                 textExtractionInterval = setInterval(extractGazedText, 500);
                 updateMicStatusUI();
@@ -1249,30 +1268,67 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!gazeCalibrator.regressionModel) return;
         if (currentSmoothPos.x === 0 && currentSmoothPos.y === 0) return;
 
+        // Local helper: when the gaze hasn't hit any real text span for longer
+        // than GAZE_NO_TEXT_FALLBACK_MS (e.g. the user is staring at a large
+        // image), fall back to the full text of the visible slide so the LLM
+        // still gets meaningful context instead of stale/empty text.
+        const tryFullSlideFallback = () => {
+            if ((performance.now() - lastRealTextHitTime) < GAZE_NO_TEXT_FALLBACK_MS) return;
+            const slideText = getVisibleSlideText();
+            if (slideText.length <= 5) return; // image-only slide: nothing to fall back to
+            if (_snippetChangedSignificantly(slideText, _lastExtractedSnippet)) {
+                currentGazedText = slideText;
+                _lastExtractedSnippet = slideText;
+                if (recentGazeHistory.length === 0 || recentGazeHistory[recentGazeHistory.length - 1] !== slideText) {
+                    recentGazeHistory.push(slideText);
+                    if (recentGazeHistory.length > 5) recentGazeHistory.shift();
+                }
+                console.log(`[GAZE] Fallback testo intera slide: "${slideText.substring(0, 80)}..."`);
+            }
+            // Refresh freshness so the fallback context is treated as current
+            lastGazedTextTimestamp = performance.now();
+        };
+
         // Temporarily disable pointer-events on the gaze dot so that
         // elementFromPoint returns the underlying text span rather than the dot itself
         gazeDot.style.pointerEvents = 'none';
         const element = document.elementFromPoint(currentSmoothPos.x, currentSmoothPos.y);
         gazeDot.style.pointerEvents = '';
 
-        if (!element) return;
+        if (!element) { tryFullSlideFallback(); return; }
         // Only spans hosted inside a .textLayer represent slide text
-        if (!element.parentNode?.classList?.contains('textLayer')) return;
+        if (!element.parentNode?.classList?.contains('textLayer')) { tryFullSlideFallback(); return; }
 
         const siblings = Array.from(element.parentNode.children);
         const index = siblings.indexOf(element);
-        if (index === -1) return;
+        if (index === -1) { tryFullSlideFallback(); return; }
 
         // Context window: 4 spans before, 8 after — asymmetric on purpose
         const snippet = siblings
             .slice(Math.max(0, index - 4), Math.min(siblings.length, index + 8))
             .map(el => el.textContent.trim()).filter(t => t.length > 0).join(' ');
 
-        if (snippet.trim().length <= 5) return;
+        if (snippet.trim().length <= 5) { tryFullSlideFallback(); return; }
+
+        // We hit real text: remember when, so the fallback timer resets.
+        lastRealTextHitTime = performance.now();
+        // --- Slide-change detection: clear the reading trail on a new page ---
+        // Each text span lives inside a .pdf-slide-wrapper carrying a data-pageNum.
+        // When the gaze moves to a different page, the previous slide's snippets
+        // are no longer relevant, so we flush recentGazeHistory to avoid the LLM
+        // staying "stuck" on the old topic.
+        const slideWrapper = element.closest?.('.pdf-slide-wrapper');
+        const currentPageNum = slideWrapper ? slideWrapper.dataset.pageNum : null;
+        if (currentPageNum !== null && currentPageNum !== lastGazedPageNum) {
+            if (lastGazedPageNum !== null) {
+                recentGazeHistory.length = 0; // svuota la cronologia: nuova slide
+                console.log(`[GAZE] Cambio slide ${lastGazedPageNum} -> ${currentPageNum}: history svuotata`);
+            }
+            lastGazedPageNum = currentPageNum;
+        }
 
         // Only update the context when the new snippet differs enough,
         // to keep the LLM prompt stable while the user re-reads the same line
-        // Only update the context when the new snippet differs enough
         if (_snippetChangedSignificantly(snippet, _lastExtractedSnippet)) {
             currentGazedText = snippet;
             _lastExtractedSnippet = snippet;
