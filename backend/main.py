@@ -1,21 +1,47 @@
+"""
+Aura backend proxy.
+
+Thin FastAPI server that sits between the browser frontend and the two
+external services Aura uses:
+
+  /api/chat → Groq LLM (chat completions)
+  /api/tts  → ElevenLabs (text-to-speech)
+
+Reasons for proxying instead of calling the providers directly from the
+browser:
+
+  - API keys are kept off the client.
+  - One CORS origin to whitelist instead of two.
+  - The chat endpoint can inject a system prompt and reshape the
+    conversation history (Gemini-style → Groq-style) on the fly.
+
+Everything is async (AsyncGroq + httpx.AsyncClient) so the event loop is
+never blocked while waiting for the LLM stream to complete.
+"""
+
+import os
+from typing import List, Optional
+
+import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from typing import List, Optional
 from groq import AsyncGroq
-import httpx
-import os
-import io
-from dotenv import load_dotenv
+from pydantic import BaseModel
 
-# Safely load environment variables from the .env file
+# Load credentials from .env before instantiating the clients below.
 load_dotenv()
 
-app = FastAPI(title="Aura Proxy Backend")
+GROQ_API_KEY = os.getenv("LLM_API_KEY")
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+# Callum voice — neutral male, well-suited to the multilingual v2 model.
+ELEVEN_VOICE_ID = "N2lVS1w4EtoT3dr4eOWO"
 
-# Strict CORS configuration to allow cross-origin requests from the web frontend
+app = FastAPI()
+
+# Permissive CORS for development. Tighten allow_origins to the
+# production domain before deploying.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,125 +50,142 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize the LLM (Large Language Model) client
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-if not LLM_API_KEY:
-    raise RuntimeError("LLM_API_KEY mancante nel file .env")
-llm_client = AsyncGroq(api_key=LLM_API_KEY)
+# Shared async Groq client. Reusing one client across requests lets the
+# underlying httpx connection pool be amortised across calls.
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Initialize ElevenLabs API Key and specific Voice ID for Text-to-Speech
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-VOICE_ID = "N2lVS1w4EtoT3dr4eOWO"  # Callum's voice ID
 
-# --- DATA MODELS ---
+# Request schemas.
 
-# Represents a single message in the chat history sent by the frontend
-class ChatMessage(BaseModel):
-    role: str                          # Either "user" or "model"
-    parts: List[dict]                  # E.g., [{"text": "..."}]
+class HistoryItem(BaseModel):
+    """One turn of the chat history as sent by the frontend (Gemini-style)."""
+    role: str               # "user" or "model"
+    parts: List[dict]       # each dict has a "text" field
 
-# Payload structure for the chat request
+
 class ChatRequest(BaseModel):
+    """Payload accepted by /api/chat."""
     user_text: str
-    emotion_state: str
-    slide_context: str
-    chat_history: Optional[List[ChatMessage]] = []   # Last 10 chat messages
+    emotion_state: str = "Normale"
+    slide_context: Optional[str] = ""
+    chat_history: List[HistoryItem] = []
 
-# Payload structure for the Text-to-Speech request
+
 class TTSRequest(BaseModel):
+    """Payload accepted by /api/tts."""
     text: str
 
-# --- ENDPOINTS ---
+
+# Endpoints.
+
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(req: ChatRequest):
+    """
+    Forward a chat turn to Groq.
+
+    Steps:
+      1. Build a system prompt that injects the live emotional state and
+         the slide context extracted via gaze tracking.
+      2. Convert the Gemini-style chat history into the Groq message
+         schema (role + content string).
+      3. Call llama-3.1-8b-instant with a short, fast configuration
+         (max_tokens=300, temperature=0.6).
+      4. Return the assistant's reply as plain JSON.
+    """
+    if not groq_client:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY non configurata.")
+
+    system_prompt = f"""Sei Aura, un tutor virtuale empatico e proattivo. Stai aiutando uno studente che sta studiando un PDF.
+
+STATO EMOTIVO ATTUALE: {req.emotion_state}
+CONTESTO DELLA SLIDE (estratto dallo sguardo): "{req.slide_context}"
+
+REGOLE FONDAMENTALI:
+1. Rispondi SEMPRE in italiano, mantenendo il tono caldo e accademico.
+2. Se la risposta richiede termini tecnici inglesi (es. "feature map", "softmax"), usali invariati.
+3. Sii concisa: una/due frasi quando possibile.
+4. Se il contesto della slide è utile, fai riferimento al concetto specifico che lo studente sta leggendo.
+5. Non chiedere "cosa non capisci, vuoi che ti spieghi, ...": OFFRI spiegazioni mirate e precise."""
+
+    # Convert chat history from Gemini-style (role/parts) to Groq-style
+    # (role/content). The "model" role becomes "assistant".
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in req.chat_history:
+        role = "assistant" if h.role == "model" else "user"
+        text = h.parts[0].get("text", "") if h.parts else ""
+        if text:
+            messages.append({"role": role, "content": text})
+    messages.append({"role": "user", "content": req.user_text})
+
     try:
-        # Inject slide context if provided by the frontend
-        context_injection = ""
-        if request.slide_context:
-            context_injection = f"Ecco il testo delle slide:\n{request.slide_context}\n"
-
-        # Construct the System Prompt guiding the AI tutor's behavior
-        system_prompt = f"""Sei Aura, un brillante tutor universitario. 
-            L'utente ha un livello di attenzione: {request.emotion_state}.
-            {context_injection}
-            
-            REGOLE STRETTE DI RISPOSTA:
-            1. NON limitarti a tradurre o riassumere il testo. Spiega il CONCETTO in modo naturale e discorsivo, come se stessi parlando a uno studente.
-            2. Usa un italiano eccellente e colloquiale. Mantieni i termini tecnici specifici in inglese (es. "Control-Value Theory", "gaze-away") senza inventare traduzioni macchinose o inesistenti (VIETATO usare parole come "addressato").
-            3. Se l'utente usa parole come "questo" o "questa cosa", sostituiscile tu nella spiegazione con il concetto reale a cui si riferisce il testo.
-            4. Vai dritto al punto senza presentarti. Sii concisa (massimo 5 frasi brevi) per permettere una sintesi vocale fluida.
-            5. ASSOLUTAMENTE NESSUNA FORMATTAZIONE (niente Markdown, elenchi, o simboli speciali). Solo testo leggibile a voce."""
-        # Build the messages array: system prompt + chat history + current user message
-        # The frontend sends history using Gemini's role format ("user"/"model").
-        # We map "model" to "assistant" to make it compatible with Groq/OpenAI APIs.
-        messages = [{"role": "system", "content": system_prompt}]
-
-        for msg in (request.chat_history or []):
-            groq_role = "assistant" if msg.role == "model" else "user"
-            text_content = msg.parts[0].get("text", "") if msg.parts else ""
-            if text_content.strip():
-                messages.append({"role": groq_role, "content": text_content})
-
-        # Append the current message from the user
-        messages.append({"role": "user", "content": request.user_text})
-
-        # Asynchronous call to the LLaMA 3 model via Groq
-        response = await llm_client.chat.completions.create(
+        completion = await groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
-            temperature=0.7,
-            max_tokens=150  # Keep the response short and concise
+            temperature=0.6,
+            max_tokens=300,
         )
-
-        # Extract and return the generated text
-        answer = response.choices[0].message.content.strip()
-        return {"text": answer}
-
+        return {"text": completion.choices[0].message.content.strip()}
     except Exception as e:
-        # Print the actual stack trace in the terminal for debugging purposes
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Errore LLM: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Errore Groq: {e}")
+
 
 @app.post("/api/tts")
-async def tts_endpoint(request: TTSRequest):
-    # Validate that the ElevenLabs API key is present
-    if not ELEVENLABS_API_KEY:
-        raise HTTPException(status_code=500, detail="ElevenLabs API Key mancante nel server.")
+async def tts_endpoint(req: TTSRequest):
+    """
+    Synthesise `text` via ElevenLabs and stream the resulting MP3 back
+    to the browser.
 
-    # Prepare the ElevenLabs API request URL and headers
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}?optimize_streaming_latency=3"
+    optimize_streaming_latency=3 trades a small amount of audio quality
+    for a noticeably shorter time-to-first-byte, which matters because
+    the avatar's mouth animation is gated on the audio actually starting.
+    """
+    if not ELEVEN_API_KEY:
+        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY non configurata.")
+
+    url = (
+        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
+        f"/stream?optimize_streaming_latency=3"
+    )
     headers = {
-        "Accept": "audio/mpeg",
+        "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY
+        "Accept": "audio/mpeg",
     }
-    
-    # Prepare the TTS payload using the requested text and a specific multilingual model
     payload = {
-        "text": request.text,
+        "text": req.text,
         "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75
-        }
+        # stability vs similarity_boost: standard balanced values that
+        # work well across italian utterances of varying length.
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }
 
-    # Make an asynchronous HTTP POST request to ElevenLabs
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=payload, timeout=30.0)
+    try:
+        # New AsyncClient per request: avoids state leaking across
+        # otherwise-unrelated TTS calls. The cost of the handshake is
+        # negligible compared to the synthesis itself.
+        client = httpx.AsyncClient(timeout=30.0)
+        r = await client.post(url, headers=headers, json=payload)
 
-    # Handle potential errors from the TTS provider
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail="Errore dal provider TTS")
+        if r.status_code == 401:
+            # Surface ElevenLabs' own error code (quota exhausted) so
+            # the frontend can switch to the browser-native fallback.
+            await client.aclose()
+            raise HTTPException(status_code=401, detail="ElevenLabs: crediti esauriti.")
+        if r.status_code != 200:
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"ElevenLabs HTTP {r.status_code}")
 
-    # Return the generated audio as a streaming response
-    return StreamingResponse(io.BytesIO(response.content), media_type="audio/mpeg")
+        # Stream the bytes back without buffering everything in memory.
+        async def gen():
+            try:
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+            finally:
+                await client.aclose()
 
-# Mount the frontend directory to serve static HTML/JS/CSS files at the root URL
-app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
+        return StreamingResponse(gen(), media_type="audio/mpeg")
 
-# Entry point to run the application using uvicorn
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Errore TTS: {e}")
